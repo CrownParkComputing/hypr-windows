@@ -81,15 +81,23 @@ def uri_host(uri):
 
 
 def probe(uri, timeout=3.0):
-    """Does the device actually answer? Returns 'online', 'offline' or 'local'."""
+    """Does the device actually answer?
+
+    'online', 'local' (USB), 'absent' (the name does not resolve, so the
+    device is not on the network at all) or 'refused' (it is there but not
+    listening). Worth separating: absent means go and switch it on, refused
+    means it is awake and something else is wrong.
+    """
     target = uri_host(uri)
     if target is None:
         return "local" if uri else "unknown"
     try:
         with socket.create_connection(target, timeout=timeout):
             return "online"
+    except socket.gaierror:
+        return "absent"
     except OSError:
-        return "offline"
+        return "refused"
 
 
 def ink_levels(uri, timeout=6):
@@ -160,3 +168,40 @@ def scan(device, source="ADF Front", mode="Color", dpi=300, out_dir=SCAN_DIR):
     # scanimage says why on stderr: out of documents, cover open, jam...
     detail = (done.stderr or "").strip().splitlines()
     return [], detail[-1] if detail else "nothing scanned"
+
+
+def scanner_options(device, timeout=40):
+    """What this scanner actually offers: sources, modes, resolutions.
+
+    Parsed from `scanimage -A`, which prints each option as
+
+        --source ADF Front|ADF Back|ADF Duplex [ADF Front]
+        --resolution 50..600dpi (in steps of 1) [600]
+
+    so a pick list comes from the pipe-separated form and a range has to be
+    turned into sensible steps. Falls back to the usual values when the
+    backend will not say.
+    """
+    text = run(["scanimage", "-A", "-d", device], timeout=timeout)
+    options = {}
+    for line in text.splitlines():
+        line = line.strip()
+        for key in ("source", "mode", "resolution"):
+            if not line.startswith("--%s " % key):
+                continue
+            body = line[len(key) + 3:].split("[")[0].strip()
+            if "|" in body:
+                options[key] = [v.strip() for v in body.split("|")]
+            elif ".." in body:
+                low, _, rest = body.partition("..")
+                high = re.match(r"(\d+)", rest)
+                try:
+                    low, high = int(low), int(high.group(1))
+                except (AttributeError, ValueError):
+                    continue
+                options[key] = [str(v) for v in (75, 150, 200, 300, 400, 600)
+                                if low <= v <= high]
+    options.setdefault("source", ["ADF Front", "ADF Back", "ADF Duplex"])
+    options.setdefault("mode", ["Color", "Gray", "Lineart"])
+    options.setdefault("resolution", ["150", "300", "600"])
+    return options

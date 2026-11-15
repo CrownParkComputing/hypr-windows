@@ -376,6 +376,7 @@ class WindowMap:
         self.device_note = ""
         self.scanning = False
         self.looking = False
+        self.scan_options = {}       # device -> what the backend offers
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -709,6 +710,21 @@ class WindowMap:
             scan.set_tooltip_text("scan every sheet in the feeder to ~/Scans")
             scan.connect("clicked", self.on_scan, scanner["device"])
             buttons.append(scan)
+            # Click a setting to step to the next value the backend offers.
+            for key, setting, label in (
+                ("source", "scan_source", "side"),
+                ("mode", "scan_mode", "mode"),
+                ("resolution", "scan_dpi", "dpi"),
+            ):
+                button = Gtk.Button(label={"source": "side", "mode": "tone",
+                                           "resolution": "dpi"}[key])
+                button.add_css_class("device-button")
+                button.set_tooltip_text(
+                    "%s: %s - click for the next value"
+                    % (label, self.config[setting]))
+                button.connect("clicked", self.on_cycle_setting,
+                               scanner["device"], key, setting)
+                buttons.append(button)
             row.append(buttons)
             section.append(row)
 
@@ -738,10 +754,17 @@ class WindowMap:
         name.set_hexpand(True)
         top.append(name)
         link = self.links.get(printer["name"])
-        mark = {"online": "online", "offline": "unreachable",
-                "local": "usb"}.get(link, "...")
+        mark = {"online": "online", "absent": "not on network",
+                "refused": "no answer", "local": "usb"}.get(link, "...")
         badge = Gtk.Label(label=mark)
-        badge.add_css_class("device-bad" if link == "offline" else "device-ok")
+        badge.add_css_class("device-bad" if link in ("absent", "refused")
+                            else "device-ok")
+        badge.set_tooltip_text(
+            {"absent": "its name does not resolve: the device is not on the "
+                       "network. Switch it on, or join the network it is on.",
+             "refused": "the host answers but the print port is closed",
+             "online": "answering on its print port",
+             "local": "connected directly, not over the network"}.get(link, ""))
         top.append(badge)
         row.append(top)
 
@@ -770,7 +793,8 @@ class WindowMap:
             ("cancel", ["cancel", "-a", printer["name"]], "queue cleared"),
             ("web", ["xdg-open", "http://localhost:631/printers/%s"
                      % printer["name"]], "opened CUPS"),
-        ):
+        ) + ((), (("default", ["lpoptions", "-d", printer["name"]],
+                   "default printer set"),))[not printer["default"]]:
             button = Gtk.Button(label=label)
             button.add_css_class("device-button")
             if label in ("off", "on"):
@@ -805,6 +829,35 @@ class WindowMap:
                 self.apply_scan_result,
                 "saved %s to ~/Scans" % message if files else message)
         threading.Thread(target=work, daemon=True).start()
+
+    def on_cycle_setting(self, _button, device, key, setting):
+        """Step a scan setting to the next value this scanner supports."""
+        options = self.scan_options.get(device)
+        if not options:
+            self.device_note = "asking the scanner what it supports..."
+            self.refresh()
+
+            def work():
+                found = hypr_devices.scanner_options(device)
+                GLib.idle_add(self.apply_options, device, found, key, setting)
+            threading.Thread(target=work, daemon=True).start()
+            return
+        self.step_setting(options, key, setting)
+
+    def apply_options(self, device, options, key, setting):
+        self.scan_options[device] = options
+        self.device_note = ""
+        self.step_setting(options, key, setting)
+        return False
+
+    def step_setting(self, options, key, setting):
+        values = options.get(key) or []
+        current = str(self.config[setting])
+        nxt = values[(values.index(current) + 1) % len(values)] \
+            if current in values else (values[0] if values else current)
+        self.config[setting] = int(nxt) if key == "resolution" else nxt
+        save_config(self.config)
+        self.refresh()
 
     def apply_scan_result(self, note):
         self.scanning = False
