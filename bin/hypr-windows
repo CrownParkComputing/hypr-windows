@@ -319,6 +319,7 @@ def css(colors):
     .ws-active { border-color: %(primary)s; }
     .ws-drop { background: alpha(%(primary_container)s, 0.9); }
     .ws-name { color: %(outline)s; font-size: 11px; font-weight: bold; }
+    .devices-title { color: %(primary)s; font-size: 13px; font-weight: bold; }
     .ws-name-active { color: %(primary)s; }
     .chip {
         background: %(surface_container_high)s;
@@ -341,19 +342,19 @@ def css(colors):
     }
     .chip-close:hover { background: %(error)s; color: %(surface)s; }
     .empty { color: alpha(%(outline)s, 0.6); font-size: 11px; }
-    .device-name { color: %(on_surface)s; font-size: 11px; font-weight: bold; }
-    .device-meta { color: %(outline)s; font-size: 10px; }
-    .device-bad { color: %(error)s; font-size: 10px; }
-    .device-ok { color: %(tertiary)s; font-size: 10px; }
+    .device-name { color: %(on_surface)s; font-size: 14px; font-weight: bold; }
+    .device-meta { color: %(outline)s; font-size: 12px; }
+    .device-bad { color: %(error)s; font-size: 12px; font-weight: bold; }
+    .device-ok { color: %(tertiary)s; font-size: 12px; font-weight: bold; }
     .device-button {
         background: %(surface_container_high)s;
-        color: %(outline)s;
+        color: %(on_surface)s;
         border: none;
-        border-radius: 6px;
-        padding: 0 6px;
+        border-radius: 7px;
+        padding: 2px 9px;
         min-height: 0;
         min-width: 0;
-        font-size: 10px;
+        font-size: 12px;
     }
     .device-button:hover { background: %(primary_container)s; color: %(primary)s; }
     .trigger { background: transparent; }
@@ -677,7 +678,7 @@ class WindowMap:
 
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         name = Gtk.Label(label="DEVICES", xalign=0.0)
-        name.add_css_class("ws-name")
+        name.add_css_class("devices-title")
         head.append(name)
         head.append(Gtk.Box(hexpand=True))
         again = Gtk.Button(label="looking..." if self.looking else "refresh")
@@ -716,7 +717,11 @@ class WindowMap:
                 xalign=0.0)
             meta.add_css_class("device-meta")
             row.append(meta)
-            buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            buttons = Gtk.FlowBox()
+            buttons.set_selection_mode(Gtk.SelectionMode.NONE)
+            buttons.set_max_children_per_line(4)
+            buttons.set_column_spacing(4)
+            buttons.set_row_spacing(4)
             scan = Gtk.Button(label="scanning..." if self.scanning else "scan")
             scan.add_css_class("device-button")
             # Live off the paper sensor: the button comes up the moment a
@@ -724,12 +729,18 @@ class WindowMap:
             # `ready` is None when the backend exposes no sensors at all, and
             # then the button stays available rather than being unusable.
             ready = status.get("ready")
-            scan.set_sensitive(not self.scanning and ready is not False)
+            # Never blocked by the sensor: a sheet the scanner has not gripped
+            # yet reads as "no paper", and a dead button would leave you
+            # unable to scan the thing you are holding. The state is shown
+            # above; pressing it when the feeder is empty just reports that.
+            scan.set_sensitive(not self.scanning)
             scan.set_tooltip_text(
-                "scan every sheet in the feeder to ~/Scans" if ready is not False
-                else "nothing to scan: %s" % (status.get("text") or "no paper"))
+                "scan every sheet in the feeder to ~/Scans"
+                if ready is not False else
+                "the feeder reads as empty (%s) - press anyway if a sheet is in"
+                % (status.get("text") or "no paper"))
             scan.connect("clicked", self.on_scan, scanner["device"])
-            buttons.append(scan)
+            buttons.insert(scan, -1)
             # Click a setting to step to the next value the backend offers.
             for key, setting, label in (
                 ("source", "scan_source", "side"),
@@ -744,7 +755,7 @@ class WindowMap:
                     % (label, self.config[setting]))
                 button.connect("clicked", self.on_cycle_setting,
                                scanner["device"], key, setting)
-                buttons.append(button)
+                buttons.insert(button, -1)
             row.append(buttons)
             section.append(row)
 
@@ -803,14 +814,18 @@ class WindowMap:
         meta.set_ellipsize(3)
         row.append(meta)
 
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        buttons = Gtk.FlowBox()
+        buttons.set_selection_mode(Gtk.SelectionMode.NONE)
+        buttons.set_max_children_per_line(4)
+        buttons.set_column_spacing(4)
+        buttons.set_row_spacing(4)
         enabled = printer["state"] != "disabled"
         for label, args, note in (
             ("test", ["lp", "-d", printer["name"],
                       "/usr/share/cups/data/testprint"], "test page sent"),
-            ("off" if enabled else "on",
+            ("pause" if enabled else "resume",
              [("cupsdisable" if enabled else "cupsenable"), printer["name"]],
-             "queue toggled"),
+             "queue paused" if enabled else "queue resumed"),
             ("cancel", ["cancel", "-a", printer["name"]], "queue cleared"),
             ("web", ["xdg-open", "http://localhost:631/printers/%s"
                      % printer["name"]], "opened CUPS"),
@@ -818,25 +833,27 @@ class WindowMap:
                    "default printer set"),))[not printer["default"]]:
             button = Gtk.Button(label=label)
             button.add_css_class("device-button")
-            if label in ("off", "on"):
+            if label in ("pause", "resume"):
                 button.set_tooltip_text(
-                    "stop the queue accepting work (the printer's own power "
-                    "button is not something a host can reach)" if label == "off"
-                    else "let the queue print again")
+                    "hold jobs in the queue instead of sending them. This is "
+                    "the queue, not the hardware: a printer's power button is "
+                    "not something a host can reach." if label == "pause"
+                    else "send held jobs to the printer again")
             button.connect("clicked", self.on_device_action, args, note)
             if label == "cancel" and not jobs:
                 button.set_sensitive(False)
-            buttons.append(button)
+            buttons.insert(button, -1)
         if link in ("absent", "refused"):
-            wake = Gtk.Button(label="on")
+            wake = Gtk.Button(label="wake")
             wake.add_css_class("device-button")
             wake.set_tooltip_text(
-                "send a wake-up packet. It only works if the printer kept "
-                "its network interface powered while asleep - one that is "
-                "properly off, or a battery one that has shut down, cannot "
-                "be woken by anything a host can send.")
+                "send a wake-on-LAN packet. This only reaches a printer that "
+                "is asleep with its network interface still powered. One that "
+                "is properly off - any battery printer that has shut down - "
+                "cannot be switched on by a host at all; it needs its own "
+                "power button.")
             wake.connect("clicked", self.on_wake, printer["uri"])
-            buttons.append(wake)
+            buttons.insert(wake, -1)
         row.append(buttons)
         return row
 
