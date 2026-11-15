@@ -119,13 +119,27 @@ DEFAULTS = {
     "all_workspaces": False,  # False: only workspaces holding windows (plus
                               # the active one and one spare to drag into)
     "devices": True,        # printers and scanners at the end of the list
-    "scan_source": "ADF Duplex",  # ADF Front | ADF Back | ADF Duplex | Flatbed
-                                  # Duplex by default: on a two-sided feeder
-                                  # it costs nothing and means a page fed
-                                  # face-down still comes back readable
-    "scan_mode": "Color",         # Color | Gray | Lineart
-    "scan_dpi": 300,              # the backend's own default of 600 is rarely
-                                  # what you want: 5096x6600 per page
+    # What you are scanning decides where it goes and how it is read. Each
+    # profile is a folder plus the settings that suit that kind of paper:
+    # duplex everywhere because a sheet fed face-down should still come back
+    # readable, auto-crop for anything smaller than a page, and blank-page
+    # skipping so the backs of one-sided documents are not kept.
+    "scan_profile": "documents",
+    "scan_profiles": [
+        {"name": "documents", "folder": "~/Scans/Documents",
+         "source": "ADF Duplex", "mode": "Color", "dpi": 300,
+         "options": ["--swdeskew=yes", "--swskip=5"]},
+        {"name": "receipts", "folder": "~/Scans/Receipts",
+         "source": "ADF Duplex", "mode": "Color", "dpi": 300,
+         "options": ["--swcrop=yes", "--swdeskew=yes", "--swskip=5",
+                     "--ald=yes"]},
+        {"name": "cards", "folder": "~/Scans/Business Cards",
+         "source": "ADF Duplex", "mode": "Color", "dpi": 600,
+         "options": ["--swcrop=yes", "--swdeskew=yes"]},
+        {"name": "photos", "folder": "~/Scans/Photos",
+         "source": "ADF Front", "mode": "Color", "dpi": 600,
+         "options": ["--swcrop=yes"]},
+    ],
     "scan_button": True,          # the scanner's own Scan button starts a
                                   # scan. Its LED cannot be driven from a
                                   # host - every sensor the backend exposes
@@ -685,6 +699,18 @@ class WindowMap:
                 self.columns.append(self.build_devices())
 
     # -- printers and scanners ----------------------------------------------
+    def profile(self):
+        """The scan profile in use, falling back to the first one defined."""
+        wanted = self.config.get("scan_profile")
+        for entry in self.config["scan_profiles"]:
+            if entry.get("name") == wanted:
+                return entry
+        return self.config["scan_profiles"][0]
+
+    def profile_folder(self, entry=None):
+        entry = entry or self.profile()
+        return os.path.expanduser(entry.get("folder") or hypr_devices.SCAN_DIR)
+
     def build_devices(self):
         """CUPS destinations and SANE scanners, in the dock's own idiom.
 
@@ -729,13 +755,19 @@ class WindowMap:
                 holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
                 holder.append(line)
                 row.append(holder)
+            entry = self.profile()
             meta = Gtk.Label(
-                label="%s %s, %d dpi" % (self.config["scan_source"].lower(),
-                                         self.config["scan_mode"].lower(),
-                                         self.config["scan_dpi"]),
+                label="%s %s, %d dpi" % (entry["source"].lower(),
+                                         entry["mode"].lower(), entry["dpi"]),
                 xalign=0.0)
             meta.add_css_class("device-meta")
             row.append(meta)
+            where = Gtk.Label(label="to %s" % entry.get("folder", "~/Scans"),
+                              xalign=0.0)
+            where.add_css_class("device-meta")
+            where.set_ellipsize(3)
+            where.set_max_width_chars(30)
+            row.append(where)
             buttons = Gtk.FlowBox()
             buttons.set_selection_mode(Gtk.SelectionMode.NONE)
             buttons.set_max_children_per_line(4)
@@ -760,20 +792,32 @@ class WindowMap:
                 % (status.get("text") or "no paper"))
             scan.connect("clicked", self.on_scan, scanner["device"])
             buttons.insert(scan, -1)
+            kind = Gtk.Button(label=entry["name"])
+            kind.add_css_class("device-button")
+            kind.set_tooltip_text(
+                "what you are scanning: documents, receipts, cards, photos.\n"
+                "Each keeps its own folder and settings - click to change.")
+            kind.connect("clicked", self.on_cycle_profile)
+            buttons.insert(kind, -1)
+
+            folder = Gtk.Button(label="folder")
+            folder.add_css_class("device-button")
+            folder.set_tooltip_text("open %s" % entry.get("folder"))
+            folder.connect("clicked", self.on_open_folder)
+            buttons.insert(folder, -1)
+
             # Click a setting to step to the next value the backend offers.
-            for key, setting, label in (
-                ("source", "scan_source", "side"),
-                ("mode", "scan_mode", "mode"),
-                ("resolution", "scan_dpi", "dpi"),
-            ):
-                button = Gtk.Button(label={"source": "side", "mode": "tone",
-                                           "resolution": "dpi"}[key])
+            for key, label in (("source", "side"), ("mode", "tone"),
+                               ("resolution", "dpi")):
+                button = Gtk.Button(label=label)
                 button.add_css_class("device-button")
                 button.set_tooltip_text(
-                    "%s: %s - click for the next value"
-                    % (label, self.config[setting]))
+                    "%s for %s: %s - click for the next value"
+                    % (label, entry["name"],
+                       entry[{"source": "source", "mode": "mode",
+                              "resolution": "dpi"}[key]]))
                 button.connect("clicked", self.on_cycle_setting,
-                               scanner["device"], key, setting)
+                               scanner["device"], key, label)
                 buttons.insert(button, -1)
             row.append(buttons)
             section.append(row)
@@ -920,13 +964,18 @@ class WindowMap:
         self.device_note = "scanning - feed the sheets now"
         self.refresh()
 
+        entry = self.profile()
+        folder = self.profile_folder(entry)
+
         def work():
             files, message = hypr_devices.scan(
-                device, source=self.config["scan_source"],
-                mode=self.config["scan_mode"], dpi=self.config["scan_dpi"])
+                device, source=entry["source"], mode=entry["mode"],
+                dpi=entry["dpi"], out_dir=folder,
+                options=entry.get("options"))
             GLib.idle_add(
                 self.apply_scan_result,
-                "saved %s to ~/Scans" % message if files else message)
+                "%s saved to %s" % (message, entry.get("folder"))
+                if files else message)
         threading.Thread(target=work, daemon=True).start()
 
     def on_cycle_setting(self, _button, device, key, setting):
@@ -950,13 +999,32 @@ class WindowMap:
         return False
 
     def step_setting(self, options, key, setting):
+        """Settings belong to the profile, so receipts can differ from photos."""
+        entry = self.profile()
+        field = {"source": "source", "mode": "mode", "resolution": "dpi"}[key]
         values = options.get(key) or []
-        current = str(self.config[setting])
+        current = str(entry[field])
         nxt = values[(values.index(current) + 1) % len(values)] \
             if current in values else (values[0] if values else current)
-        self.config[setting] = int(nxt) if key == "resolution" else nxt
+        entry[field] = int(nxt) if key == "resolution" else nxt
         save_config(self.config)
         self.refresh()
+
+    def on_cycle_profile(self, _button):
+        names = [e.get("name") for e in self.config["scan_profiles"]]
+        current = self.profile().get("name")
+        self.config["scan_profile"] = names[
+            (names.index(current) + 1) % len(names)] if current in names \
+            else names[0]
+        save_config(self.config)
+        self.refresh()
+
+    def on_open_folder(self, _button):
+        folder = self.profile_folder()
+        os.makedirs(folder, exist_ok=True)
+        threading.Thread(
+            target=lambda: hypr_devices.run(["xdg-open", folder], timeout=10),
+            daemon=True).start()
 
     def apply_scan_result(self, note):
         self.scanning = False

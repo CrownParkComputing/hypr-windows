@@ -145,7 +145,8 @@ def list_scanners(timeout=40):
     return found
 
 
-def scan(device, source="ADF Front", mode="Color", dpi=300, out_dir=SCAN_DIR):
+def scan(device, source="ADF Front", mode="Color", dpi=300, out_dir=SCAN_DIR,
+         options=None):
     """Scan whatever is in the feeder. Returns (files written, message).
 
     The backend's own defaults are Lineart at 600dpi from the front side,
@@ -158,7 +159,8 @@ def scan(device, source="ADF Front", mode="Color", dpi=300, out_dir=SCAN_DIR):
     try:
         done = subprocess.run(
             ["scanimage", "-d", device, "--source", source, "--mode", mode,
-             "--resolution", str(dpi), "--format=png", "--batch=" + pattern],
+             "--resolution", str(dpi), *(options or []),
+             "--format=png", "--batch=" + pattern],
             capture_output=True, text=True, timeout=900)
     except (subprocess.SubprocessError, OSError) as error:
         return [], str(error)
