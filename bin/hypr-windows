@@ -719,8 +719,15 @@ class WindowMap:
             buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
             scan = Gtk.Button(label="scanning..." if self.scanning else "scan")
             scan.add_css_class("device-button")
-            scan.set_sensitive(not self.scanning)
-            scan.set_tooltip_text("scan every sheet in the feeder to ~/Scans")
+            # Live off the paper sensor: the button comes up the moment a
+            # sheet is in the feeder and greys out when it is taken away.
+            # `ready` is None when the backend exposes no sensors at all, and
+            # then the button stays available rather than being unusable.
+            ready = status.get("ready")
+            scan.set_sensitive(not self.scanning and ready is not False)
+            scan.set_tooltip_text(
+                "scan every sheet in the feeder to ~/Scans" if ready is not False
+                else "nothing to scan: %s" % (status.get("text") or "no paper"))
             scan.connect("clicked", self.on_scan, scanner["device"])
             buttons.append(scan)
             # Click a setting to step to the next value the backend offers.
