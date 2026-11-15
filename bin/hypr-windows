@@ -97,6 +97,9 @@ if "--help" not in sys.argv and "-h" not in sys.argv:
             signal_running(signal.SIGTERM if locked else signal.SIGUSR1)
         sys.exit(0)
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import hypr_devices  # noqa: E402
+
 import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
@@ -113,6 +116,10 @@ DEFAULTS = {
     "width": 300,           # thickness of a left/right dock, in pixels
     "hide_delay_ms": 600,   # grace period before a popped-in dock withdraws
     "trigger_px": 4,        # thickness of the edge strip that pops it in
+    "devices": True,        # printers and scanners at the end of the list
+    "device_seconds": 15,   # how often to re-read the local CUPS queue
+    "probe_seconds": 90,    # how often to ask the network if a printer is there
+    "scanner_seconds": 600, # how often to re-enumerate SANE scanners
 }
 
 # Workspaces that always get a section, so there is somewhere to drop a window
@@ -249,7 +256,7 @@ def palette():
         "surface_container_high": "#2d2a20", "on_surface": "#e8e2d4",
         "outline": "#969180", "primary": "#d9c76f",
         "primary_container": "#534619", "on_primary_container": "#f6e48a",
-        "error": "#ffb4ab",
+        "error": "#ffb4ab", "tertiary": "#b0cfaa",
     }
     try:
         with open(COLORS_CONF) as handle:
@@ -325,6 +332,21 @@ def css(colors):
     }
     .chip-close:hover { background: %(error)s; color: %(surface)s; }
     .empty { color: alpha(%(outline)s, 0.6); font-size: 11px; }
+    .device-name { color: %(on_surface)s; font-size: 11px; font-weight: bold; }
+    .device-meta { color: %(outline)s; font-size: 10px; }
+    .device-bad { color: %(error)s; font-size: 10px; }
+    .device-ok { color: %(tertiary)s; font-size: 10px; }
+    .device-button {
+        background: %(surface_container_high)s;
+        color: %(outline)s;
+        border: none;
+        border-radius: 6px;
+        padding: 0 6px;
+        min-height: 0;
+        min-width: 0;
+        font-size: 10px;
+    }
+    .device-button:hover { background: %(primary_container)s; color: %(primary)s; }
     .trigger { background: transparent; }
     """ % colors
 
@@ -341,6 +363,10 @@ class WindowMap:
         self.pending = 0
         self.hide_timer = 0
         self.out = False
+        self.printers = []
+        self.scanners = []
+        self.links = {}
+        self.scanned_at = 0
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -456,6 +482,15 @@ class WindowMap:
 
         spacer = Gtk.Box(hexpand=True)
         row.append(spacer)
+
+        devices = Gtk.Button(label="DEV")
+        devices.set_tooltip_text("show printers and scanners at the end")
+        if self.config["devices"]:
+            devices.add_css_class("chosen")
+        devices.connect(
+            "clicked",
+            lambda *_: self.restart({"devices": not self.config["devices"]}))
+        row.append(devices)
 
         lock = Gtk.Button(label="LOCKED" if self.locked else "POP-IN")
         lock.set_tooltip_text(
@@ -585,6 +620,175 @@ class WindowMap:
             self.columns.append(self.build_section(
                 key, grouped.get(key, []), active_ids, active_special,
                 focused_address))
+        if self.config["devices"]:
+            self.columns.append(self.build_devices())
+
+    # -- printers and scanners ----------------------------------------------
+    def build_devices(self):
+        """CUPS destinations and SANE scanners, in the dock's own idiom.
+
+        The state CUPS reports and whether the device actually answers are
+        two different things: a queue says `idle` for a printer that is
+        asleep, off, or on a network you have left.
+        """
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        section.add_css_class("ws")
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        name = Gtk.Label(label="DEVICES", xalign=0.0)
+        name.add_css_class("ws-name")
+        head.append(name)
+        head.append(Gtk.Box(hexpand=True))
+        again = Gtk.Button(label="scan")
+        again.add_css_class("device-button")
+        again.set_tooltip_text("look for printers and scanners again")
+        again.connect("clicked", lambda *_: self.refresh_devices(force=True))
+        head.append(again)
+        section.append(head)
+
+        for printer in self.printers:
+            section.append(self.device_row(printer))
+        for scanner in self.scanners:
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            row.add_css_class("chip")
+            title = Gtk.Label(
+                label="%s %s" % (scanner["vendor"], scanner["model"]),
+                xalign=0.0)
+            title.add_css_class("device-name")
+            title.set_ellipsize(3)
+            title.set_max_width_chars(26)
+            row.append(title)
+            meta = Gtk.Label(label="scanner - click to scan", xalign=0.0)
+            meta.add_css_class("device-meta")
+            row.append(meta)
+            click = Gtk.GestureClick()
+            click.connect("released", self.on_scan, scanner["device"])
+            row.add_controller(click)
+            section.append(row)
+
+        if not self.printers and not self.scanners:
+            empty = Gtk.Label(
+                label="nothing found yet" if not self.scanned_at
+                else "no printers or scanners", xalign=0.0)
+            empty.add_css_class("empty")
+            section.append(empty)
+        return section
+
+    def device_row(self, printer):
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        row.add_css_class("chip")
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        name = Gtk.Label(label=printer["name"].replace("-", " "), xalign=0.0)
+        name.add_css_class("device-name")
+        name.set_ellipsize(3)
+        name.set_max_width_chars(22)
+        name.set_hexpand(True)
+        top.append(name)
+        link = self.links.get(printer["name"])
+        mark = {"online": "online", "offline": "unreachable",
+                "local": "usb"}.get(link, "...")
+        badge = Gtk.Label(label=mark)
+        badge.add_css_class("device-bad" if link == "offline" else "device-ok")
+        top.append(badge)
+        row.append(top)
+
+        jobs = len(printer["jobs"])
+        state = printer["state"]
+        if not printer["accepting"]:
+            state += ", not accepting"
+        meta = Gtk.Label(
+            label="%s%s%s" % (
+                state,
+                "" if not jobs else "  -  %d job%s" % (jobs, "" if jobs == 1 else "s"),
+                "" if printer["default"] else ""),
+            xalign=0.0)
+        meta.add_css_class("device-meta")
+        meta.set_ellipsize(3)
+        row.append(meta)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for label, args, note in (
+            ("test", ["lp", "-d", printer["name"],
+                      "/usr/share/cups/data/testprint"], "test page sent"),
+            ("cancel", ["cancel", "-a", printer["name"]], "queue cleared"),
+            ("web", ["xdg-open", "http://localhost:631/printers/%s"
+                     % printer["name"]], "opened CUPS"),
+        ):
+            button = Gtk.Button(label=label)
+            button.add_css_class("device-button")
+            button.connect("clicked", self.on_device_action, args, note)
+            if label == "cancel" and not jobs:
+                button.set_sensitive(False)
+            buttons.append(button)
+        row.append(buttons)
+        return row
+
+    def on_device_action(self, _button, args, _note):
+        threading.Thread(
+            target=lambda: (hypr_devices.run(args, timeout=15),
+                            GLib.idle_add(self.refresh_devices)),
+            daemon=True).start()
+
+    def on_scan(self, _gesture, _n, _x, _y, device):
+        import time
+        os.makedirs(hypr_devices.SCAN_DIR, exist_ok=True)
+        target = os.path.join(hypr_devices.SCAN_DIR,
+                              "scan-%s.png" % time.strftime("%Y%m%d-%H%M%S"))
+        threading.Thread(
+            target=lambda: hypr_devices.run(
+                ["scanimage", "-d", device, "--format=png", "-o", target],
+                timeout=300),
+            daemon=True).start()
+
+    def refresh_devices(self, force=False):
+        """Local CUPS state now; the slow probes on their own schedules."""
+        def work():
+            printers = hypr_devices.read_queue()
+            GLib.idle_add(self.apply_devices, printers)
+        threading.Thread(target=work, daemon=True).start()
+        if force:
+            self.probe_devices()
+            self.find_scanners()
+        return True
+
+    def apply_devices(self, printers):
+        fresh = {p["name"] for p in printers} - set(self.links)
+        self.printers = printers
+        self.refresh()
+        if fresh:
+            # Chain the first probe to the queue landing: fired alongside it,
+            # it would run against an empty list and leave every printer
+            # showing "..." until the next sweep.
+            self.probe_devices()
+        return False
+
+    def probe_devices(self):
+        def work():
+            links = {p["name"]: hypr_devices.probe(p["uri"])
+                     for p in list(self.printers)}
+            GLib.idle_add(self.apply_links, links)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_links(self, links):
+        self.links = links
+        self.refresh()
+        return False
+
+    def find_scanners(self):
+        def work():
+            found = hypr_devices.list_scanners()
+            GLib.idle_add(self.apply_scanners, found)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_scanners(self, found):
+        import time
+        self.scanners = found
+        self.scanned_at = time.time()
+        self.refresh()
+        return False
 
     def build_section(self, key, windows, active_ids, active_special, focused):
         is_active = (key in active_ids if isinstance(key, int)
@@ -758,6 +962,14 @@ def main():
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
                          lambda: (widget.toggle_visible(), True)[1])
     widget.watch_events()
+    if config["devices"]:
+        widget.refresh_devices()
+        widget.find_scanners()
+        GLib.timeout_add_seconds(config["device_seconds"],
+                                 widget.refresh_devices)
+        GLib.timeout_add_seconds(config["probe_seconds"], widget.probe_devices)
+        GLib.timeout_add_seconds(config["scanner_seconds"],
+                                 widget.find_scanners)
     try:
         loop.run()
     finally:

@@ -102,7 +102,22 @@ To put it on the bar in place of waybar's workspace buttons, see
 | Drag a chip onto a workspace | Moves that window there |
 | Click a chip's ✕ | Closes that window |
 | `L` `R` `T` `B` | Moves the dock to that edge |
+| `DEV` | Shows or hides the printers and scanners section |
 | `LOCKED` / `POP-IN` | Locks the dock open, or lets it slide away |
+
+### Printers and scanners
+
+With `DEV` on, the end of the list holds every CUPS destination and SANE
+scanner: what CUPS reports (idle, printing, stopped, not accepting), whether
+the device **actually answers** — a queue says `idle` for a printer that is
+asleep or on a network you have left — how many jobs are waiting, and buttons
+for a test page, clearing the queue and its CUPS page. Click a scanner to scan
+to `~/Scans`.
+
+The probes are slow (about 3s for a sleeping printer to refuse a connection,
+7s if mDNS has to fail first, 10s for `scanimage -L` to find nothing), so they
+run on worker threads: the queue every 15s, reachability every 90s, scanners
+every 10 minutes, and all three at once from the section's **scan** button.
 
 Settings live in `~/.config/hypr-windows/config.json` and are written whenever
 you change them from the dock:
@@ -114,7 +129,11 @@ you change them from the dock:
                            // false: slides off the edge, pops in on touch
   "width": 300,            // thickness of a left/right dock
   "hide_delay_ms": 600,    // grace period before it slides away again
-  "trigger_px": 4          // sliver left on screen to touch when slid out
+  "trigger_px": 4,         // sliver left on screen to touch when slid out
+  "devices": true,         // printers and scanners at the end of the list
+  "device_seconds": 15,    // re-read the local CUPS queue
+  "probe_seconds": 90,     // re-test whether printers answer
+  "scanner_seconds": 600   // re-enumerate SANE scanners
 }
 ```
 
