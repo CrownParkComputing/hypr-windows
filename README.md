@@ -10,7 +10,18 @@ and the top line always names the window that currently has focus.
 It docks to any edge, either locked open — reserving its strip so tiled
 windows sit beside it — or popping in when the pointer touches the edge.
 
-![left dock](docs/dock-left.png)
+<img src="docs/dock-left.png" alt="docked on the left" width="300">
+
+## Screenshots
+
+Docked along the top instead, with the workspaces running across:
+
+![top panel](docs/panel-top.png)
+
+The bar button it replaces four workspace buttons with — click to open the
+dock, scroll to change workspace:
+
+![bar button](docs/bar-button.png)
 
 ## Why
 
@@ -18,14 +29,67 @@ Hyprland hides a lot of state: windows parked on another workspace, windows in
 a special workspace (the usual "show desktop" minimise), and nothing on screen
 says what has focus. This puts all of it in one place you can act on.
 
+## Requirements
+
+- **Hyprland 0.57 or newer.** It drives the compositor through the Lua
+  dispatcher API that 0.57 introduced, so it will not work on 0.4x.
+- `gtk4`, `gtk4-layer-shell`, `python-gobject`, and Python 3.9+.
+
+```sh
+# Arch
+sudo pacman -S gtk4 gtk4-layer-shell python-gobject
+
+# Fedora
+sudo dnf install gtk4 gtk4-layer-shell python3-gobject
+
+# Debian/Ubuntu (gtk4-layer-shell may need a backport or a build)
+sudo apt install libgtk-4-1 libgtk4-layer-shell0 python3-gi
+```
+
 ## Install
 
 ```sh
+git clone https://github.com/CrownParkComputing/hypr-windows
+cd hypr-windows
 ./install.sh            # symlinks bin/* into ~/.local/bin
 hypr-windows            # start it (run again to toggle)
 ```
 
-Needs `gtk4`, `gtk4-layer-shell`, `python-gobject` and `hyprctl`.
+To start it with your session, use a systemd user unit:
+
+```ini
+# ~/.config/systemd/user/hypr-windows.service
+[Unit]
+Description=hypr-windows dock
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/hypr-windows --no-toggle
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+```sh
+systemctl --user enable --now hypr-windows
+```
+
+**Do not launch it straight from `hl.on("hyprland.start", ...)`.** That
+handler runs about 0.1s into the compositor's boot, but
+`$XDG_RUNTIME_DIR/wayland-N` only appears around 3s in, so every Wayland
+client started there dies instantly with "cannot connect to display" — which
+looks random, because non-Wayland commands in the same handler survive. If you
+want it in the config anyway, wait for the socket first:
+
+```lua
+hl.on("hyprland.start", function()
+    hl.dispatch(hl.dsp.exec_cmd(
+        "bash -c 'until [ -S \"$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY\" ]; "
+        .. "do sleep 0.2; done; exec hypr-windows --no-toggle'"))
+end)
+```
 
 To put it on the bar in place of waybar's workspace buttons, see
 [`waybar/README.md`](waybar/README.md).

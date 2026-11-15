@@ -284,7 +284,7 @@ class WindowMap:
         self.vertical = self.position in ("left", "right")
         self.pending = 0
         self.hide_timer = 0
-        self.trigger = None
+        self.out = False
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -380,8 +380,8 @@ class WindowMap:
             # to a hidden dock, and an unmapped dock cannot catch a pointer.
             self.slide_out()
         if os.environ.get("HYPR_WINDOWS_DEBUG"):
-            print("position=%s locked=%s trigger=%s dock_visible=%s"
-                  % (self.position, self.locked, bool(self.trigger),
+            print("position=%s locked=%s slid_out=%s visible=%s"
+                  % (self.position, self.locked, self.out,
                      self.window.get_visible()), flush=True)
 
     # -- settings -----------------------------------------------------------
@@ -449,7 +449,7 @@ class WindowMap:
 
     def pop_in(self):
         self.cancel_hide()
-        if getattr(self, "out", False):
+        if self.out:
             self.refresh()
             self.edge_margin(0)
             self.out = False
@@ -475,7 +475,7 @@ class WindowMap:
         """SIGUSR1, so a keybind or a bar button can show it without a relaunch."""
         if self.locked:
             return
-        if getattr(self, "out", False):
+        if self.out:
             self.pop_in()
         else:
             self.hide_now()
