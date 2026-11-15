@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Waybar custom module: the workspace strip that replaced the four numbered
+buttons (custom/ws1..ws4).
+
+It prints the same numbers, so the bar still says where you are, but it is one
+button: clicking it toggles the hypr-windows overview, scrolling moves a
+workspace. The active workspace is highlighted, workspaces holding windows are
+bright, empty ones are dim, and a workspace above the usual four only appears
+once something is on it.
+
+Refreshed on SIGRTMIN+8, which rice-ws-watch already sends on every workspace
+change, plus the module's own interval as a backstop.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+COLORS_CONF = os.path.expanduser("~/.config/hypr/colors.conf")
+ALWAYS = 4           # workspaces 1-4 are always shown, as the buttons were
+BRIGHT = "#F6F5F4"
+DIM = "#666666"
+
+
+def hyprctl(args):
+    try:
+        out = subprocess.run(["hyprctl", "-j", *args], capture_output=True,
+                             text=True, timeout=2, check=True).stdout
+        return json.loads(out)
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+def ensure_instance():
+    """Recover from a stale HYPRLAND_INSTANCE_SIGNATURE.
+
+    waybar outlives a compositor restart (waybar-watch owns it), so the
+    signature it inherited can point at a dead instance - the same trap
+    ws-go and ws-state guard against.
+    """
+    if hyprctl(["activeworkspace"]):
+        return
+    base = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr")
+    try:
+        names = sorted(os.listdir(base), reverse=True,
+                       key=lambda n: os.path.getmtime(os.path.join(base, n)))
+    except OSError:
+        return
+    for name in names:
+        if os.path.exists(os.path.join(base, name, ".socket.sock")):
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = name
+            if hyprctl(["activeworkspace"]):
+                return
+
+
+def active_colour():
+    """The rice's $primary, regenerated from the wallpaper.
+
+    Not waybar's @ws_active: that grey only reads as "active" with the CSS
+    glow behind it, and pango markup has no glow, so it would make the
+    workspace you are on the dimmest number in the row.
+    """
+    try:
+        with open(COLORS_CONF) as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("$primary ") and "rgba(" in line:
+                    return "#" + line.split("rgba(", 1)[1][:6]
+    except OSError:
+        pass
+    return "#d9c76f"
+
+
+def main():
+    ensure_instance()
+    clients = hyprctl(["clients"]) or []
+    current = (hyprctl(["activeworkspace"]) or {}).get("id")
+
+    counts, parked = {}, 0
+    for client in clients:
+        workspace = client.get("workspace") or {}
+        if str(workspace.get("name", "")).startswith("special:"):
+            parked += 1
+        elif workspace.get("id") is not None:
+            counts[workspace["id"]] = counts.get(workspace["id"], 0) + 1
+
+    ids = sorted(set(range(1, ALWAYS + 1)) | set(counts))
+    accent = active_colour()
+    parts = []
+    for ws in ids:
+        if ws == current:
+            parts.append("<span color='%s'><b>%d</b></span>" % (accent, ws))
+        elif counts.get(ws):
+            parts.append("<span color='%s'>%d</span>" % (BRIGHT, ws))
+        else:
+            parts.append("<span color='%s'>%d</span>" % (DIM, ws))
+    if parked:
+        # Windows hidden by SUPER+M would otherwise vanish from the bar.
+        parts.append("<span color='%s'>+%d</span>" % (DIM, parked))
+
+    lines = ["click: show/hide the window overview", "scroll: change workspace", ""]
+    for ws in ids:
+        count = counts.get(ws, 0)
+        lines.append("%d: %s%s" % (
+            ws, "empty" if not count else
+            "%d window%s" % (count, "" if count == 1 else "s"),
+            "   <- here" if ws == current else ""))
+    if parked:
+        lines.append("minimised: %d window%s" % (parked, "" if parked == 1 else "s"))
+
+    print(json.dumps({
+        "text": " ".join(parts),
+        "tooltip": "\n".join(lines),
+        "class": "active" if current else "inactive",
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

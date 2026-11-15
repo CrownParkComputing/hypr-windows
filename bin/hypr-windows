@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""hypr-windows - an on-screen window map and dock for Hyprland 0.57.
+
+Every open window, grouped by the workspace it sits on. Click a window to go
+to it, drag it onto another workspace to move it, press its X to close it,
+and the top line always names the window that currently has focus.
+
+It can live on any edge, either locked open as a dock that reserves its strip
+or popping in from the edge when the pointer touches it.
+
+Hyprland 0.57's dispatchers are Lua and only honour a window *object*:
+"address:0x..." as a string either fails to parse or - for close - is accepted
+and acted on whatever window has focus, which is how an unrelated browser
+window once died here. So every action goes through `hyprctl eval` with a loop
+over hl.get_windows() matched on w.address, the one form that reliably targets
+the window you meant.
+"""
+
+import os
+import sys
+
+# gtk4-layer-shell has to be loaded before libwayland-client, which a script
+# cannot arrange at link time. Re-exec once with it preloaded, or the window
+# comes up as an ordinary toplevel instead of a dock.
+_PRELOAD = "/usr/lib/libgtk4-layer-shell.so"
+if not os.environ.get("HYPR_WINDOWS_PRELOAD") and os.path.exists(_PRELOAD):
+    os.environ["HYPR_WINDOWS_PRELOAD"] = "1"
+    _existing = os.environ.get("LD_PRELOAD", "")
+    os.environ["LD_PRELOAD"] = _PRELOAD + (":" + _existing if _existing else "")
+    os.environ.setdefault("GTK_A11Y", "none")
+    os.execv(sys.executable,
+             [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+import json  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, GLib, GObject, Gtk, Gtk4LayerShell  # noqa: E402
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PID_FILE = os.path.join(RUNTIME, "hypr-windows.pid")
+CONFIG_DIR = os.path.expanduser("~/.config/hypr-windows")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+COLORS_CONF = os.path.expanduser("~/.config/hypr/colors.conf")
+
+DEFAULTS = {
+    "position": "left",     # left | right | top | bottom
+    "locked": True,         # True: a dock that reserves its strip
+                            # False: pops in when the pointer touches the edge
+    "width": 300,           # thickness of a left/right dock, in pixels
+    "hide_delay_ms": 600,   # grace period before a popped-in dock withdraws
+    "trigger_px": 4,        # thickness of the edge strip that pops it in
+}
+
+# Workspaces that always get a section, so there is somewhere to drop a window
+# even when the workspace is empty.
+BASE_WORKSPACES = list(range(1, 10))
+
+
+# ------------------------------------------------------------------ config --
+def load_config():
+    config = dict(DEFAULTS)
+    try:
+        with open(CONFIG_FILE) as handle:
+            stored = json.load(handle)
+        if isinstance(stored, dict):
+            config.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    except (OSError, json.JSONDecodeError):
+        pass
+    return config
+
+
+def save_config(config):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- hyprland --
+def hypr_json(command):
+    """Run `hyprctl -j <command>` and return the parsed reply."""
+    try:
+        out = subprocess.run(
+            ["hyprctl", "-j", *command.split()],
+            capture_output=True, text=True, timeout=2, check=True,
+        ).stdout
+        return json.loads(out)
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+def hypr_lua(code):
+    """Evaluate Lua in the compositor. It answers 'ok' and returns nothing."""
+    try:
+        subprocess.run(["hyprctl", "eval", code],
+                       capture_output=True, text=True, timeout=2)
+    except subprocess.SubprocessError:
+        pass
+
+
+def ensure_instance():
+    """Recover from a stale HYPRLAND_INSTANCE_SIGNATURE.
+
+    A bar launches this, and a bar can outlive a compositor restart, so the
+    signature we inherit may name a dead instance. Fix it before anything
+    reads the event socket, whose path is keyed by the signature.
+    """
+    if hypr_json("activeworkspace"):
+        return
+    base = os.path.join(RUNTIME, "hypr")
+    try:
+        names = sorted(os.listdir(base), reverse=True,
+                       key=lambda n: os.path.getmtime(os.path.join(base, n)))
+    except OSError:
+        return
+    for name in names:
+        if os.path.exists(os.path.join(base, name, ".socket.sock")):
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = name
+            if hypr_json("activeworkspace"):
+                return
+
+
+def for_window(address, body):
+    """Lua that runs `body` (a statement using `w`) for one window only."""
+    return (
+        "for _, w in ipairs(hl.get_windows()) do\n"
+        f"  if w.address == '{address}' then\n"
+        f"    {body}\n"
+        "  end\n"
+        "end"
+    )
+
+
+def move_window(address, workspace):
+    hypr_lua(for_window(
+        address,
+        "hl.dispatch(hl.dsp.window.move({ workspace = %s, silent = true, "
+        "window = w }))" % workspace,
+    ))
+
+
+def focus_window(address):
+    """Go to the window: switch to its workspace first, then focus it.
+
+    Focusing alone leaves you looking at the workspace you were already on,
+    so a click on a window living elsewhere appears to do nothing. The
+    workspace comes off the window object, not our last refresh, so it is
+    right even if the window moved a moment ago.
+    """
+    hypr_lua(for_window(address, """
+    local ws = w.workspace
+    if ws and ws.id and not ws.special then
+      hl.dispatch(hl.dsp.focus({ workspace = ws.id }))
+    end
+    hl.dispatch(hl.dsp.focus({ window = w }))
+    """.strip()))
+
+
+def close_window(address):
+    """Close one window.
+
+    The object form targets the window given, unlike close("address:0x..."),
+    which is accepted and then closes whatever has focus. Verified by closing
+    an unfocused throwaway while a second throwaway held focus: the target
+    died, the focused window lived.
+    """
+    hypr_lua(for_window(
+        address, "hl.dispatch(hl.dsp.window.close({ window = w }))"
+    ))
+
+
+def lua_workspace(key):
+    """Lua literal for a workspace: a number for normal, a string for special."""
+    return key if isinstance(key, int) else "'special:%s'" % key
+
+
+# ------------------------------------------------------------------ colors --
+def palette():
+    """Follow the rice's wallpaper-derived palette when there is one."""
+    colors = {
+        "surface": "#15130c", "surface_container": "#222017",
+        "surface_container_high": "#2d2a20", "on_surface": "#e8e2d4",
+        "outline": "#969180", "primary": "#d9c76f",
+        "primary_container": "#534619", "on_primary_container": "#f6e48a",
+        "error": "#ffb4ab",
+    }
+    try:
+        with open(COLORS_CONF) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line.startswith("$") or "rgba(" not in line:
+                    continue
+                name, _, value = line[1:].partition("=")
+                digits = value.strip()[5:-1]
+                if len(digits) >= 6:
+                    colors[name.strip()] = "#" + digits[:6]
+    except OSError:
+        pass
+    return colors
+
+
+def css(colors):
+    return """
+    window.panel { background: transparent; }
+    .panel-body {
+        background: alpha(%(surface_container)s, 0.94);
+        border: 1px solid alpha(%(outline)s, 0.5);
+        border-radius: 16px;
+        padding: 10px 12px;
+    }
+    .focus-line { font-size: 12px; color: %(on_surface)s; }
+    .focus-label { color: %(outline)s; font-size: 11px; }
+    .focus-title { color: %(primary)s; font-weight: bold; }
+    .settings-row button {
+        background: alpha(%(surface)s, 0.8);
+        color: %(outline)s;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        padding: 1px 7px;
+        min-height: 0;
+        min-width: 0;
+        font-size: 10px;
+        font-weight: bold;
+    }
+    .settings-row button:hover { color: %(on_surface)s; }
+    .settings-row button.chosen {
+        color: %(primary)s;
+        border-color: alpha(%(primary)s, 0.7);
+    }
+    .ws {
+        background: alpha(%(surface)s, 0.75);
+        border: 1px solid transparent;
+        border-radius: 12px;
+        padding: 6px;
+    }
+    .ws-active { border-color: %(primary)s; }
+    .ws-drop { background: alpha(%(primary_container)s, 0.9); }
+    .ws-name { color: %(outline)s; font-size: 11px; font-weight: bold; }
+    .ws-name-active { color: %(primary)s; }
+    .chip {
+        background: %(surface_container_high)s;
+        border-radius: 9px;
+        padding: 3px 4px 3px 7px;
+    }
+    .chip:hover { background: %(primary_container)s; }
+    .chip-focused { background: %(primary_container)s; }
+    .chip-class { color: %(primary)s; font-size: 11px; font-weight: bold; }
+    .chip-title { color: %(on_surface)s; font-size: 11px; }
+    .chip-close {
+        background: transparent;
+        color: alpha(%(outline)s, 0.7);
+        border: none;
+        border-radius: 6px;
+        padding: 0 4px;
+        min-height: 0;
+        min-width: 0;
+        font-size: 11px;
+    }
+    .chip-close:hover { background: %(error)s; color: %(surface)s; }
+    .empty { color: alpha(%(outline)s, 0.6); font-size: 11px; }
+    .trigger { background: transparent; }
+    """ % colors
+
+
+# -------------------------------------------------------------------- view --
+class WindowMap:
+    def __init__(self, config):
+        self.config = config
+        self.position = config["position"]
+        self.locked = bool(config["locked"])
+        # On a side the workspaces stack down the screen; along the top or
+        # bottom they run across it.
+        self.vertical = self.position in ("left", "right")
+        self.pending = 0
+        self.hide_timer = 0
+        self.trigger = None
+
+        edges = Gtk4LayerShell.Edge
+        anchor = {"left": edges.LEFT, "right": edges.RIGHT,
+                  "top": edges.TOP, "bottom": edges.BOTTOM}[self.position]
+
+        self.window = Gtk.Window()
+        self.window.add_css_class("panel")
+        Gtk4LayerShell.init_for_window(self.window)
+        Gtk4LayerShell.set_layer(self.window, Gtk4LayerShell.Layer.TOP)
+        Gtk4LayerShell.set_anchor(self.window, anchor, True)
+        if self.vertical:
+            # Span the full height so it reads as a dock, not a floating card.
+            Gtk4LayerShell.set_anchor(self.window, edges.TOP, True)
+            Gtk4LayerShell.set_anchor(self.window, edges.BOTTOM, True)
+            self.window.set_size_request(config["width"], -1)
+        else:
+            Gtk4LayerShell.set_margin(self.window, anchor, 18)
+        if self.locked:
+            # Reserve the strip: tiled windows end beside the dock instead of
+            # underneath it. A popped-in dock deliberately reserves nothing,
+            # so showing it never reshuffles the windows you are looking at.
+            Gtk4LayerShell.auto_exclusive_zone_enable(self.window)
+        # Pointer only: with keyboard focus the dock would become the focused
+        # window and the focus line would only ever name itself.
+        Gtk4LayerShell.set_keyboard_mode(
+            self.window, Gtk4LayerShell.KeyboardMode.NONE)
+        if hasattr(Gtk4LayerShell, "set_namespace"):
+            Gtk4LayerShell.set_namespace(self.window, "hypr-windows")
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.add_css_class("panel-body")
+        if self.vertical:
+            # The surface is full height because it is anchored top and
+            # bottom; without this the card paints only as tall as its
+            # content while still reserving the whole strip.
+            body.set_vexpand(True)
+            body.set_valign(Gtk.Align.FILL)
+        self.window.set_child(body)
+        self.body = body
+
+        body.append(self.build_settings_row())
+
+        focus_line = Gtk.Box(
+            orientation=(Gtk.Orientation.VERTICAL if self.vertical
+                         else Gtk.Orientation.HORIZONTAL),
+            spacing=(2 if self.vertical else 8))
+        focus_line.add_css_class("focus-line")
+        label = Gtk.Label(label="FOCUS", xalign=0.0)
+        label.add_css_class("focus-label")
+        focus_line.append(label)
+        self.focus_title = Gtk.Label(label="-", xalign=0.0)
+        self.focus_title.add_css_class("focus-title")
+        self.focus_title.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        self.focus_title.set_max_width_chars(28 if self.vertical else 70)
+        self.focus_title.set_wrap(self.vertical)
+        self.focus_title.set_lines(2 if self.vertical else 1)
+        focus_line.append(self.focus_title)
+        body.append(focus_line)
+
+        self.columns = Gtk.Box(
+            orientation=(Gtk.Orientation.VERTICAL if self.vertical
+                         else Gtk.Orientation.HORIZONTAL),
+            spacing=(6 if self.vertical else 8))
+        if self.vertical:
+            # A long window list scrolls rather than pushing the dock off the
+            # bottom of the screen.
+            scroller = Gtk.ScrolledWindow(vexpand=True)
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_child(self.columns)
+            body.append(scroller)
+        else:
+            body.append(self.columns)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css(palette()).encode())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # Unlocked, the dock withdraws when the pointer leaves it.
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: self.pop_in())
+        motion.connect("leave", lambda *_: self.start_hide())
+        self.window.add_controller(motion)
+
+        self.window.present()
+        self.refresh()
+        if not self.locked:
+            # Pop-in: the dock stays mapped and slides off the edge on a
+            # negative margin, leaving a few pixels peeking. One surface that
+            # never unmaps, so the pointer always has something to touch -
+            # a separate hair-thin trigger window refused to map at all next
+            # to a hidden dock, and an unmapped dock cannot catch a pointer.
+            self.slide_out()
+        if os.environ.get("HYPR_WINDOWS_DEBUG"):
+            print("position=%s locked=%s trigger=%s dock_visible=%s"
+                  % (self.position, self.locked, bool(self.trigger),
+                     self.window.get_visible()), flush=True)
+
+    # -- settings -----------------------------------------------------------
+    def build_settings_row(self):
+        """Where the dock lives, and whether it stays, set from the dock."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.add_css_class("settings-row")
+        for position, label in (("left", "L"), ("right", "R"),
+                                ("top", "T"), ("bottom", "B")):
+            button = Gtk.Button(label=label)
+            button.set_tooltip_text("dock on the %s" % position)
+            if position == self.position:
+                button.add_css_class("chosen")
+            button.connect("clicked", self.on_position, position)
+            row.append(button)
+
+        spacer = Gtk.Box(hexpand=True)
+        row.append(spacer)
+
+        lock = Gtk.Button(label="LOCKED" if self.locked else "POP-IN")
+        lock.set_tooltip_text(
+            "locked: always here, windows tile beside it\n"
+            "pop-in: hidden until the pointer touches the %s edge"
+            % self.position)
+        if self.locked:
+            lock.add_css_class("chosen")
+        lock.connect("clicked", self.on_lock)
+        row.append(lock)
+        return row
+
+    def on_position(self, _button, position):
+        self.restart({"position": position})
+
+    def on_lock(self, _button):
+        self.restart({"locked": not self.locked})
+
+    def restart(self, changes):
+        """Persist a setting and come back up with it.
+
+        Anchors, the exclusive zone and the layout orientation are all fixed
+        when the surface is built, so settling them by restarting is simpler
+        and more predictable than mutating a live layer surface.
+        """
+        config = dict(self.config)
+        config.update(changes)
+        save_config(config)
+        os.execv(sys.executable,
+                 [sys.executable, os.path.abspath(__file__), "--no-toggle"])
+
+    # -- pop-in -------------------------------------------------------------
+    def edge_margin(self, pixels):
+        edges = Gtk4LayerShell.Edge
+        anchor = {"left": edges.LEFT, "right": edges.RIGHT,
+                  "top": edges.TOP, "bottom": edges.BOTTOM}[self.position]
+        Gtk4LayerShell.set_margin(self.window, anchor, pixels)
+
+    def slide_out(self):
+        """Park the dock off the edge with a sliver left to touch."""
+        if self.locked:
+            return
+        thickness = (self.config["width"] if self.vertical
+                     else self.window.get_allocated_height() or 230)
+        self.edge_margin(-(thickness - max(2, self.config["trigger_px"])))
+        self.out = True
+
+    def pop_in(self):
+        self.cancel_hide()
+        if getattr(self, "out", False):
+            self.refresh()
+            self.edge_margin(0)
+            self.out = False
+
+    def start_hide(self):
+        if self.locked:
+            return
+        self.cancel_hide()
+        self.hide_timer = GLib.timeout_add(
+            self.config["hide_delay_ms"], self.hide_now)
+
+    def cancel_hide(self):
+        if self.hide_timer:
+            GLib.source_remove(self.hide_timer)
+            self.hide_timer = 0
+
+    def hide_now(self):
+        self.hide_timer = 0
+        self.slide_out()
+        return False
+
+    def toggle_visible(self):
+        """SIGUSR1, so a keybind or a bar button can show it without a relaunch."""
+        if self.locked:
+            return
+        if getattr(self, "out", False):
+            self.pop_in()
+        else:
+            self.hide_now()
+
+    # -- data ---------------------------------------------------------------
+    def refresh(self):
+        self.pending = 0
+        clients = hypr_json("clients") or []
+        monitors = hypr_json("monitors") or []
+        active_ids, active_special = set(), set()
+        for monitor in monitors:
+            workspace = monitor.get("activeWorkspace") or {}
+            if workspace.get("id") is not None:
+                active_ids.add(workspace["id"])
+            special = monitor.get("specialWorkspace") or {}
+            if special.get("name"):
+                active_special.add(special["name"].replace("special:", ""))
+
+        focused = hypr_json("activewindow") or {}
+        focused_address = focused.get("address")
+        if focused.get("title"):
+            self.focus_title.set_text(
+                "%s  -  %s" % (focused.get("class") or "?", focused["title"]))
+        else:
+            self.focus_title.set_text("(nothing focused)")
+
+        # Group by workspace: normal ones by id, special ones by their short
+        # name, so a window parked in a special workspace stays visible.
+        grouped = {}
+        for client in clients:
+            workspace = client.get("workspace") or {}
+            name = str(workspace.get("name", ""))
+            if name.startswith("special:"):
+                key = name.replace("special:", "")
+            elif workspace.get("id") is not None:
+                key = workspace["id"]
+            else:
+                continue
+            grouped.setdefault(key, []).append(client)
+
+        keys = list(BASE_WORKSPACES)
+        keys += sorted(k for k in grouped if isinstance(k, int) and k not in keys)
+        keys += sorted(k for k in grouped if isinstance(k, str))
+
+        child = self.columns.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.columns.remove(child)
+            child = nxt
+        for key in keys:
+            self.columns.append(self.build_section(
+                key, grouped.get(key, []), active_ids, active_special,
+                focused_address))
+
+    def build_section(self, key, windows, active_ids, active_special, focused):
+        is_active = (key in active_ids if isinstance(key, int)
+                     else key in active_special)
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        section.add_css_class("ws")
+        if is_active:
+            section.add_css_class("ws-active")
+
+        label = str(key) if isinstance(key, int) else key.upper()
+        name = Gtk.Label(label=label, xalign=0.0 if self.vertical else 0.5)
+        name.add_css_class("ws-name")
+        if is_active:
+            name.add_css_class("ws-name-active")
+        section.append(name)
+
+        if windows:
+            for client in windows:
+                section.append(self.build_chip(client, focused))
+        else:
+            placeholder = Gtk.Label(label="drop here",
+                                    xalign=0.0 if self.vertical else 0.5)
+            placeholder.add_css_class("empty")
+            section.append(placeholder)
+
+        target = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        target.connect("drop", self.on_drop, key)
+        target.connect("enter", self.on_drop_enter, section)
+        target.connect("leave", self.on_drop_leave, section)
+        section.add_controller(target)
+        return section
+
+    def build_chip(self, client, focused):
+        address = client.get("address", "")
+        title = str(client.get("title") or "")
+        chip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        chip.add_css_class("chip")
+        if address and address == focused:
+            chip.add_css_class("chip-focused")
+
+        klass = Gtk.Label(label=(client.get("class") or "?")[:14], xalign=0.0)
+        klass.add_css_class("chip-class")
+        chip.append(klass)
+        name = Gtk.Label(label=title, xalign=0.0)
+        name.add_css_class("chip-title")
+        name.set_ellipsize(3)
+        name.set_max_width_chars(26)
+        name.set_hexpand(True)
+        chip.append(name)
+        chip.set_tooltip_text("%s\n%s\n\nclick to go to it, drag to a "
+                              "workspace, X to close"
+                              % (client.get("class") or "?", title))
+
+        close = Gtk.Button(label="✕")
+        close.add_css_class("chip-close")
+        close.set_tooltip_text("close this window")
+        close.connect("clicked", self.on_close_clicked, address)
+        chip.append(close)
+
+        source = Gtk.DragSource()
+        source.set_actions(Gdk.DragAction.MOVE)
+        source.connect("prepare", self.on_drag_prepare, address)
+        chip.add_controller(source)
+
+        click = Gtk.GestureClick()
+        click.connect("released", self.on_chip_clicked, address)
+        chip.add_controller(click)
+        return chip
+
+    # -- interaction --------------------------------------------------------
+    def on_drag_prepare(self, _source, _x, _y, address):
+        return Gdk.ContentProvider.new_for_value(address)
+
+    def on_drop(self, _target, value, _x, _y, key):
+        if value:
+            move_window(value, lua_workspace(key))
+            self.schedule_refresh(120)
+        return True
+
+    def on_drop_enter(self, _target, _x, _y, section):
+        section.add_css_class("ws-drop")
+        return Gdk.DragAction.MOVE
+
+    def on_drop_leave(self, _target, section):
+        section.remove_css_class("ws-drop")
+
+    def on_chip_clicked(self, _gesture, _n, _x, _y, address):
+        focus_window(address)
+        self.schedule_refresh(120)
+
+    def on_close_clicked(self, _button, address):
+        close_window(address)
+        self.schedule_refresh(200)
+
+    # -- live updates -------------------------------------------------------
+    def schedule_refresh(self, delay=60):
+        """Collapse the burst of events one action produces into one redraw."""
+        if self.pending:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(delay, self.refresh)
+
+    def watch_events(self):
+        signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+        path = os.path.join(RUNTIME, "hypr", signature, ".socket2.sock")
+
+        def reader():
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(path)
+            except OSError:
+                return
+            buffer = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    event = line.decode("utf-8", "replace").split(">>")[0]
+                    if event in ("activewindow", "activewindowv2", "openwindow",
+                                 "closewindow", "movewindow", "movewindowv2",
+                                 "workspace", "workspacev2", "focusedmon",
+                                 "windowtitle", "windowtitlev2", "fullscreen",
+                                 "activespecial", "monitoradded"):
+                        GLib.idle_add(self.schedule_refresh)
+
+        threading.Thread(target=reader, daemon=True).start()
+
+
+# -------------------------------------------------------------------- main --
+def toggle_off(config):
+    """What a second invocation does to the instance already running.
+
+    Locked, it is a dock you are switching off, so it quits. In pop-in mode
+    it should stay for the edge to work, so SIGUSR1 slides it in or out
+    instead - that is what makes a bar button sensible in both modes.
+    Returns True when the running instance handled it and we should not start.
+    """
+    try:
+        with open(PID_FILE) as handle:
+            pid = int(handle.read().strip())
+    except (OSError, ValueError):
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM if config["locked"] else signal.SIGUSR1)
+        return True
+    except OSError:
+        return False
+
+
+def parse_args(config):
+    """Flags override the stored settings; --save makes them the settings."""
+    args = sys.argv[1:]
+    for position in ("left", "right", "top", "bottom"):
+        if "--" + position in args:
+            config["position"] = position
+    if "--lock" in args:
+        config["locked"] = True
+    if "--pop-in" in args or "--no-lock" in args:
+        config["locked"] = False
+    if "--width" in args:
+        try:
+            config["width"] = int(args[args.index("--width") + 1])
+        except (IndexError, ValueError):
+            pass
+    if "--save" in args:
+        save_config(config)
+    return config
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        print("usage: hypr-windows [--left|--right|--top|--bottom] "
+              "[--lock|--pop-in] [--width N] [--save] [--no-toggle]")
+        print("settings file: %s" % CONFIG_FILE)
+        return 0
+
+    config = parse_args(load_config())
+    if "--no-toggle" not in sys.argv and toggle_off(config):
+        return 0
+    with open(PID_FILE, "w") as handle:
+        handle.write(str(os.getpid()))
+
+    ensure_instance()
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig,
+                             lambda: (loop.quit(), True)[1])
+    widget = WindowMap(config)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                         lambda: (widget.toggle_visible(), True)[1])
+    widget.watch_events()
+    try:
+        loop.run()
+    finally:
+        try:
+            if int(open(PID_FILE).read().strip()) == os.getpid():
+                os.unlink(PID_FILE)
+        except (OSError, ValueError):
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
