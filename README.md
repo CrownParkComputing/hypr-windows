@@ -134,6 +134,8 @@ hl.bind("SUPER + W", hl.dsp.exec_cmd("pkill -USR1 -f hypr-windows"))
 
 Running `hypr-windows` again quits a locked dock, and slides a pop-in one
 in or out — so one bar button or keybind does the right thing in both modes.
+Only one copy can ever run: a second launch acts on the first instead of
+starting beside it.
 
 ## Notes for anyone hacking on it
 
@@ -151,6 +153,11 @@ Three things here cost real time to find:
   ordinary toplevel. `hypr-windows` re-execs itself once with
   `LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so`; the `liblayer-shell-preload.so`
   in the same package does *not* fix it.
+- **A PID file is not enough to keep one instance.** GTK takes about a second
+  to come up, so two clicks inside that window both find no PID file and both
+  start — two docks, each reserving a strip. The singleton is a `flock` taken
+  before the GTK import, so the loser exits immediately; the PID file is only
+  there to carry the running instance's mode to whoever signals it.
 - **A hair-thin trigger window would not map** beside a hidden dock, and an
   unmapped dock cannot catch a pointer. Pop-in therefore keeps one surface
   mapped and slides it off the edge with a negative margin, leaving a few

@@ -31,11 +31,71 @@ if not os.environ.get("HYPR_WINDOWS_PRELOAD") and os.path.exists(_PRELOAD):
     os.execv(sys.executable,
              [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
+import fcntl  # noqa: E402
 import json  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PID_FILE = os.path.join(RUNTIME, "hypr-windows.pid")
+LOCK_FILE = os.path.join(RUNTIME, "hypr-windows.lock")
+CONFIG_DIR = os.path.expanduser("~/.config/hypr-windows")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+
+def claim_singleton():
+    """Hold an exclusive lock for as long as this instance lives.
+
+    A PID file alone loses a race: GTK takes about a second to come up, so
+    two clicks inside that window both find no PID file and both start. The
+    lock is taken here, before the GTK import, so the second one always
+    loses. It is dropped automatically when the process exits, and released
+    across the re-exec a settings change does (the fd is close-on-exec),
+    which is why the new image can take it straight back.
+    """
+    handle = open(LOCK_FILE, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        handle.close()
+        return None
+
+
+def signal_running(sig):
+    try:
+        with open(PID_FILE) as handle:
+            pid = int(handle.read().split()[0])
+        if pid != os.getpid():
+            os.kill(pid, sig)
+    except (OSError, ValueError):
+        pass
+
+
+if "--help" not in sys.argv and "-h" not in sys.argv:
+    _LOCK = claim_singleton()
+    if _LOCK is None:
+        # Somebody is already up. A plain launch toggles them - quitting a
+        # locked dock, sliding a pop-in one - and --no-toggle just leaves.
+        if "--no-toggle" not in sys.argv:
+            # The running instance records the mode it is actually in on the
+            # second line of its PID file, which is what matters here: a flag
+            # override means the stored config can say something else.
+            locked = True
+            try:
+                with open(PID_FILE) as handle:
+                    lines = handle.read().split()
+                locked = lines[1] != "pop-in"
+            except (OSError, IndexError):
+                try:
+                    with open(CONFIG_FILE) as handle:
+                        locked = bool(json.load(handle).get("locked", True))
+                except (OSError, ValueError):
+                    pass
+            signal_running(signal.SIGTERM if locked else signal.SIGUSR1)
+        sys.exit(0)
 
 import gi  # noqa: E402
 
@@ -44,10 +104,6 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
 from gi.repository import Gdk, GLib, GObject, Gtk, Gtk4LayerShell  # noqa: E402
 
-RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
-PID_FILE = os.path.join(RUNTIME, "hypr-windows.pid")
-CONFIG_DIR = os.path.expanduser("~/.config/hypr-windows")
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 COLORS_CONF = os.path.expanduser("~/.config/hypr/colors.conf")
 
 DEFAULTS = {
@@ -660,28 +716,6 @@ class WindowMap:
 
 
 # -------------------------------------------------------------------- main --
-def toggle_off(config):
-    """What a second invocation does to the instance already running.
-
-    Locked, it is a dock you are switching off, so it quits. In pop-in mode
-    it should stay for the edge to work, so SIGUSR1 slides it in or out
-    instead - that is what makes a bar button sensible in both modes.
-    Returns True when the running instance handled it and we should not start.
-    """
-    try:
-        with open(PID_FILE) as handle:
-            pid = int(handle.read().strip())
-    except (OSError, ValueError):
-        return False
-    if pid == os.getpid():
-        return False
-    try:
-        os.kill(pid, signal.SIGTERM if config["locked"] else signal.SIGUSR1)
-        return True
-    except OSError:
-        return False
-
-
 def parse_args(config):
     """Flags override the stored settings; --save makes them the settings."""
     args = sys.argv[1:]
@@ -711,10 +745,9 @@ def main():
         return 0
 
     config = parse_args(load_config())
-    if "--no-toggle" not in sys.argv and toggle_off(config):
-        return 0
     with open(PID_FILE, "w") as handle:
-        handle.write(str(os.getpid()))
+        handle.write("%d %s\n" % (os.getpid(),
+                                   "locked" if config["locked"] else "pop-in"))
 
     ensure_instance()
     loop = GLib.MainLoop()
@@ -729,7 +762,7 @@ def main():
         loop.run()
     finally:
         try:
-            if int(open(PID_FILE).read().strip()) == os.getpid():
+            if int(open(PID_FILE).read().split()[0]) == os.getpid():
                 os.unlink(PID_FILE)
         except (OSError, ValueError):
             pass
