@@ -126,7 +126,11 @@ DEFAULTS = {
     "scan_mode": "Color",         # Color | Gray | Lineart
     "scan_dpi": 300,              # the backend's own default of 600 is rarely
                                   # what you want: 5096x6600 per page
-    "sensor_seconds": 4,          # how often to re-read scanner sensors.
+    "scan_button": True,          # the scanner's own Scan button starts a
+                                  # scan. Its LED cannot be driven from a
+                                  # host - every sensor the backend exposes
+                                  # is read-only - but the press is readable
+    "sensor_seconds": 2,          # how often to re-read scanner sensors.
                                   # Naming the device makes this ~13ms; it is
                                   # `scanimage -L` enumeration that costs 8s
     "device_seconds": 15,   # how often to re-read the local CUPS queue
@@ -1016,6 +1020,14 @@ class WindowMap:
         if status != self.scan_status:
             self.scan_status = status
             self.refresh()
+        if self.config["scan_button"] and not self.scanning:
+            # The Scan button on the machine: the backend cannot light it,
+            # but it can tell us it was pressed, so pressing it does the
+            # obvious thing.
+            for device, state in status.items():
+                if state.get("sensors", {}).get("scan"):
+                    self.on_scan(None, device)
+                    break
         return False
 
     def find_scanners(self):
