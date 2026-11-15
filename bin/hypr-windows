@@ -116,14 +116,20 @@ DEFAULTS = {
     "width": 300,           # thickness of a left/right dock, in pixels
     "hide_delay_ms": 600,   # grace period before a popped-in dock withdraws
     "trigger_px": 4,        # thickness of the edge strip that pops it in
+    "all_workspaces": False,  # False: only workspaces holding windows (plus
+                              # the active one and one spare to drag into)
     "devices": True,        # printers and scanners at the end of the list
+    "scan_source": "ADF Front",   # ADF Front | ADF Back | ADF Duplex | Flatbed
+    "scan_mode": "Color",         # Color | Gray | Lineart
+    "scan_dpi": 300,              # the backend's own default of 600 is rarely
+                                  # what you want: 5096x6600 per page
     "device_seconds": 15,   # how often to re-read the local CUPS queue
     "probe_seconds": 90,    # how often to ask the network if a printer is there
     "scanner_seconds": 600, # how often to re-enumerate SANE scanners
 }
 
-# Workspaces that always get a section, so there is somewhere to drop a window
-# even when the workspace is empty.
+# The workspaces a full listing shows (config: all_workspaces). The default
+# listing is built from what is actually in use instead.
 BASE_WORKSPACES = list(range(1, 10))
 
 
@@ -367,6 +373,7 @@ class WindowMap:
         self.scanners = []
         self.links = {}
         self.scanned_at = 0
+        self.device_note = ""
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -616,8 +623,18 @@ class WindowMap:
                 continue
             grouped.setdefault(key, []).append(client)
 
-        keys = list(BASE_WORKSPACES)
-        keys += sorted(k for k in grouped if isinstance(k, int) and k not in keys)
+        occupied = {k for k in grouped if isinstance(k, int)}
+        if self.config["all_workspaces"]:
+            keys = sorted(set(BASE_WORKSPACES) | occupied | active_ids)
+        else:
+            # Only workspaces that hold something, plus the one you are on.
+            keys = sorted(occupied | active_ids)
+            # ...and one spare, so there is still somewhere to drag a window
+            # to start a new workspace. Without it, hiding the empty ones
+            # would take the feature away.
+            spare = next(n for n in range(1, 100)
+                         if n not in occupied and n not in active_ids)
+            keys.append(spare)
         keys += sorted(k for k in grouped if isinstance(k, str))
 
         child = self.columns.get_first_child()
@@ -689,6 +706,12 @@ class WindowMap:
                 else "no printers or scanners", xalign=0.0)
             empty.add_css_class("empty")
             section.append(empty)
+        if self.device_note:
+            note = Gtk.Label(label=self.device_note, xalign=0.0)
+            note.add_css_class("device-meta")
+            note.set_wrap(True)
+            note.set_max_width_chars(34)
+            section.append(note)
         return section
 
     def device_row(self, printer):
@@ -757,15 +780,23 @@ class WindowMap:
             daemon=True).start()
 
     def on_scan(self, _gesture, _n, _x, _y, device):
-        import time
-        os.makedirs(hypr_devices.SCAN_DIR, exist_ok=True)
-        target = os.path.join(hypr_devices.SCAN_DIR,
-                              "scan-%s.png" % time.strftime("%Y%m%d-%H%M%S"))
-        threading.Thread(
-            target=lambda: hypr_devices.run(
-                ["scanimage", "-d", device, "--format=png", "-o", target],
-                timeout=300),
-            daemon=True).start()
+        """Scan everything in the feeder, in colour at a sane resolution."""
+        self.device_note = "scanning..."
+        self.refresh()
+
+        def work():
+            files, message = hypr_devices.scan(
+                device, source=self.config["scan_source"],
+                mode=self.config["scan_mode"], dpi=self.config["scan_dpi"])
+            GLib.idle_add(
+                self.apply_scan_result,
+                "saved %s to ~/Scans" % message if files else message)
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_scan_result(self, note):
+        self.device_note = note
+        self.refresh()
+        return False
 
     def refresh_devices(self, force=False):
         """Local CUPS state now; the slow probes on their own schedules."""

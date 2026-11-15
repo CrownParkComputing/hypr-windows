@@ -7,10 +7,12 @@ resolution first, and `scanimage -L` takes ten seconds to report an empty bus.
 Call all of it from a worker thread.
 """
 
+import glob
 import os
 import re
 import socket
 import subprocess
+import time
 
 SCAN_DIR = os.path.expanduser("~/Scans")
 
@@ -110,13 +112,51 @@ def ink_levels(uri, timeout=6):
     return list(zip(names or ["ink"] * len(levels), levels))
 
 
-def list_scanners(timeout=25):
-    """SANE devices. Slow - ten seconds even when the answer is 'none'."""
-    text = run(["scanimage", "-L", "-f", "%d|%v|%m%n"], timeout=timeout)
+def list_scanners(timeout=40):
+    """SANE devices. Slow - eight to ten seconds even to say 'none'.
+
+    Parsed from the sentence scanimage prints, not from `-f`: this version
+    accepts the format string and then ignores it, so a formatted parse
+    silently finds nothing and the UI claims there is no scanner.
+
+        device `fujitsu:ScanSnap iX1600:1901633' is a FUJITSU ScanSnap iX1600 scanner
+    """
+    text = run(["scanimage", "-L"], timeout=timeout)
     found = []
     for line in text.splitlines():
-        if line.count("|") == 2:
-            device, vendor, model = line.split("|")
-            found.append({"device": device.strip(), "vendor": vendor.strip(),
-                          "model": model.strip()})
+        match = re.match(r"device `([^']+)' is a (.+?)\s*$", line.strip())
+        if not match:
+            continue
+        description = match.group(2)
+        if description.endswith(" scanner"):
+            description = description[:-len(" scanner")]
+        parts = description.split(None, 1)
+        found.append({"device": match.group(1),
+                      "vendor": parts[0] if parts else "",
+                      "model": parts[1] if len(parts) > 1 else ""})
     return found
+
+
+def scan(device, source="ADF Front", mode="Color", dpi=300, out_dir=SCAN_DIR):
+    """Scan whatever is in the feeder. Returns (files written, message).
+
+    The backend's own defaults are Lineart at 600dpi from the front side,
+    which gives a 5096x6600 bitonal page nobody wants; colour at 300 is the
+    useful default. --batch takes every sheet in the hopper rather than one.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    pattern = os.path.join(out_dir, "scan-%s-%%03d.png" % stamp)
+    try:
+        done = subprocess.run(
+            ["scanimage", "-d", device, "--source", source, "--mode", mode,
+             "--resolution", str(dpi), "--format=png", "--batch=" + pattern],
+            capture_output=True, text=True, timeout=900)
+    except (subprocess.SubprocessError, OSError) as error:
+        return [], str(error)
+    files = sorted(glob.glob(os.path.join(out_dir, "scan-%s-*.png" % stamp)))
+    if files:
+        return files, "%d page%s" % (len(files), "" if len(files) == 1 else "s")
+    # scanimage says why on stderr: out of documents, cover open, jam...
+    detail = (done.stderr or "").strip().splitlines()
+    return [], detail[-1] if detail else "nothing scanned"
