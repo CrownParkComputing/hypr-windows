@@ -430,6 +430,7 @@ class WindowMap:
             orientation=(Gtk.Orientation.VERTICAL if self.vertical
                          else Gtk.Orientation.HORIZONTAL),
             spacing=(6 if self.vertical else 8))
+        self.devices_box = None
         if self.vertical:
             # A long window list scrolls rather than pushing the dock off the
             # bottom of the screen.
@@ -437,6 +438,14 @@ class WindowMap:
             scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             scroller.set_child(self.columns)
             body.append(scroller)
+            if config["devices"]:
+                # Pinned below the scroller, so the printers stay put however
+                # many windows are open instead of scrolling out of reach.
+                body.append(Gtk.Separator(
+                    orientation=Gtk.Orientation.HORIZONTAL))
+                self.devices_box = Gtk.Box(
+                    orientation=Gtk.Orientation.VERTICAL, spacing=5)
+                body.append(self.devices_box)
         else:
             body.append(self.columns)
 
@@ -621,7 +630,15 @@ class WindowMap:
                 key, grouped.get(key, []), active_ids, active_special,
                 focused_address))
         if self.config["devices"]:
-            self.columns.append(self.build_devices())
+            if self.devices_box is not None:
+                child = self.devices_box.get_first_child()
+                while child:
+                    nxt = child.get_next_sibling()
+                    self.devices_box.remove(child)
+                    child = nxt
+                self.devices_box.append(self.build_devices())
+            else:
+                self.columns.append(self.build_devices())
 
     # -- printers and scanners ----------------------------------------------
     def build_devices(self):
@@ -708,15 +725,24 @@ class WindowMap:
         row.append(meta)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        enabled = printer["state"] != "disabled"
         for label, args, note in (
             ("test", ["lp", "-d", printer["name"],
                       "/usr/share/cups/data/testprint"], "test page sent"),
+            ("off" if enabled else "on",
+             [("cupsdisable" if enabled else "cupsenable"), printer["name"]],
+             "queue toggled"),
             ("cancel", ["cancel", "-a", printer["name"]], "queue cleared"),
             ("web", ["xdg-open", "http://localhost:631/printers/%s"
                      % printer["name"]], "opened CUPS"),
         ):
             button = Gtk.Button(label=label)
             button.add_css_class("device-button")
+            if label in ("off", "on"):
+                button.set_tooltip_text(
+                    "stop the queue accepting work (the printer's own power "
+                    "button is not something a host can reach)" if label == "off"
+                    else "let the queue print again")
             button.connect("clicked", self.on_device_action, args, note)
             if label == "cancel" and not jobs:
                 button.set_sensitive(False)
