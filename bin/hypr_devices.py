@@ -205,3 +205,88 @@ def scanner_options(device, timeout=40):
     options.setdefault("mode", ["Color", "Gray", "Lineart"])
     options.setdefault("resolution", ["150", "300", "600"])
     return options
+
+
+def scanner_status(device, timeout=40):
+    """What the scanner's own sensors say, so the panel can tell you it is
+    ready rather than making you look at the machine.
+
+    `scanimage -A` prints each sensor with its current value in brackets:
+
+        --page-loaded[=(yes|no)] [yes] [hardware]
+        --cover-open[=(yes|no)] [no] [hardware]
+
+    On a sheet-fed scanner the paper chute has to be open to load anything,
+    so 'cover open' is only worth reporting when there is no page waiting.
+    """
+    text = run(["scanimage", "-A", "-d", device], timeout=timeout)
+    sensors = {}
+    for line in text.splitlines():
+        match = re.match(r"\s*--([a-z0-9-]+)\[=\(yes\|no\)\]\s+\[(yes|no)\]",
+                         line)
+        if match:
+            sensors[match.group(1)] = match.group(2) == "yes"
+    if not sensors:
+        return {"ready": None, "text": "", "sensors": {}}
+
+    loaded = sensors.get("page-loaded", False)
+    if sensors.get("power-save"):
+        return {"ready": False, "text": "asleep", "sensors": sensors}
+    if sensors.get("omr-df"):
+        return {"ready": False, "text": "double feed - clear it",
+                "sensors": sensors}
+    if loaded:
+        return {"ready": True, "text": "paper loaded - ready", "sensors": sensors}
+    if sensors.get("cover-open"):
+        return {"ready": False, "text": "chute open, no paper",
+                "sensors": sensors}
+    return {"ready": False, "text": "no paper in the feeder",
+            "sensors": sensors}
+
+
+def device_mac(uri):
+    """The device's MAC, for a wake-up packet.
+
+    HP names itself HP<MAC> over mDNS, which is the only clue left once it
+    has stopped answering; otherwise look for a neighbour entry whose address
+    matches the host in the URI.
+    """
+    target = uri_host(uri)
+    if not target:
+        return None
+    host = target[0]
+    match = re.match(r"(?i)HP([0-9A-F]{12})\.?(?:local\.?)?$", host)
+    if match:
+        raw = match.group(1)
+        return ":".join(raw[i:i + 2] for i in range(0, 12, 2)).lower()
+    for line in run(["ip", "neigh"]).splitlines():
+        parts = line.split()
+        if parts and parts[0] == host and "lladdr" in parts:
+            return parts[parts.index("lladdr") + 1].lower()
+    return None
+
+
+def wake(mac, port=9):
+    """Send a Wake-on-LAN magic packet.
+
+    Best effort by nature: it only does anything if the device kept its
+    network interface powered while asleep and has wake-on-LAN enabled. A
+    printer that is properly off - or a battery one that has shut down -
+    cannot be woken by anything a host can send.
+    """
+    try:
+        clean = re.sub(r"[^0-9a-fA-F]", "", mac or "")
+        if len(clean) != 12:
+            return False, "no MAC known for this device"
+        payload = b"\xff" * 6 + bytes.fromhex(clean) * 16
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for address in ("255.255.255.255", "192.168.255.255"):
+            try:
+                sock.sendto(payload, (address, port))
+            except OSError:
+                continue
+        sock.close()
+        return True, "wake-up sent to %s" % clean
+    except (OSError, ValueError) as error:
+        return False, str(error)

@@ -123,6 +123,9 @@ DEFAULTS = {
     "scan_mode": "Color",         # Color | Gray | Lineart
     "scan_dpi": 300,              # the backend's own default of 600 is rarely
                                   # what you want: 5096x6600 per page
+    "sensor_seconds": 4,          # how often to re-read scanner sensors.
+                                  # Naming the device makes this ~13ms; it is
+                                  # `scanimage -L` enumeration that costs 8s
     "device_seconds": 15,   # how often to re-read the local CUPS queue
     "probe_seconds": 90,    # how often to ask the network if a printer is there
     "scanner_seconds": 600, # how often to re-enumerate SANE scanners
@@ -377,6 +380,7 @@ class WindowMap:
         self.scanning = False
         self.looking = False
         self.scan_options = {}       # device -> what the backend offers
+        self.scan_status = {}        # device -> what its sensors say
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -696,6 +700,15 @@ class WindowMap:
             title.set_ellipsize(3)
             title.set_max_width_chars(26)
             row.append(title)
+            status = self.scan_status.get(scanner["device"], {})
+            if status.get("text"):
+                line = Gtk.Label(
+                    label="%s %s" % ("\u25cf" if status.get("ready") else
+                                     "\u25cb", status["text"]),
+                    xalign=0.0)
+                line.add_css_class("device-ok" if status.get("ready")
+                                   else "device-bad")
+                row.append(line)
             meta = Gtk.Label(
                 label="%s %s, %d dpi" % (self.config["scan_source"].lower(),
                                          self.config["scan_mode"].lower(),
@@ -754,11 +767,12 @@ class WindowMap:
         name.set_hexpand(True)
         top.append(name)
         link = self.links.get(printer["name"])
-        mark = {"online": "online", "absent": "not on network",
-                "refused": "no answer", "local": "usb"}.get(link, "...")
-        badge = Gtk.Label(label=mark)
-        badge.add_css_class("device-bad" if link in ("absent", "refused")
-                            else "device-ok")
+        mark = {"online": "on", "absent": "off / not on network",
+                "refused": "no answer", "local": "usb"}.get(link, "checking")
+        good = link in ("online", "local")
+        badge = Gtk.Label(label="%s %s" % ("\u25cf" if link else "\u25cb", mark))
+        badge.add_css_class("device-ok" if good else
+                            ("device-bad" if link else "device-meta"))
         badge.set_tooltip_text(
             {"absent": "its name does not resolve: the device is not on the "
                        "network. Switch it on, or join the network it is on.",
@@ -806,8 +820,29 @@ class WindowMap:
             if label == "cancel" and not jobs:
                 button.set_sensitive(False)
             buttons.append(button)
+        if link in ("absent", "refused"):
+            wake = Gtk.Button(label="on")
+            wake.add_css_class("device-button")
+            wake.set_tooltip_text(
+                "send a wake-up packet. It only works if the printer kept "
+                "its network interface powered while asleep - one that is "
+                "properly off, or a battery one that has shut down, cannot "
+                "be woken by anything a host can send.")
+            wake.connect("clicked", self.on_wake, printer["uri"])
+            buttons.append(wake)
         row.append(buttons)
         return row
+
+    def on_wake(self, _button, uri):
+        self.device_note = "waking..."
+        self.refresh()
+
+        def work():
+            mac = hypr_devices.device_mac(uri)
+            sent, message = hypr_devices.wake(mac)
+            GLib.idle_add(self.apply_scan_result,
+                          message if sent else "could not wake: %s" % message)
+        threading.Thread(target=work, daemon=True).start()
 
     def on_device_action(self, _button, args, _note):
         threading.Thread(
@@ -863,6 +898,8 @@ class WindowMap:
         self.scanning = False
         self.device_note = note
         self.refresh()
+        # The feeder is emptier than it was: re-read the sensors.
+        self.find_scanners()
         return False
 
     def refresh_devices(self, force=False):
@@ -900,6 +937,24 @@ class WindowMap:
         self.refresh()
         return False
 
+    def refresh_scan_status(self):
+        """Re-read sensors only - no enumeration, so this is nearly free."""
+        if not self.scanners or self.scanning:
+            return True
+
+        def work():
+            status = {s["device"]: hypr_devices.scanner_status(s["device"])
+                      for s in list(self.scanners)}
+            GLib.idle_add(self.apply_scan_status, status)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_scan_status(self, status):
+        if status != self.scan_status:
+            self.scan_status = status
+            self.refresh()
+        return False
+
     def find_scanners(self):
         if self.looking:
             return True
@@ -908,14 +963,17 @@ class WindowMap:
 
         def work():
             found = hypr_devices.list_scanners()
-            GLib.idle_add(self.apply_scanners, found)
+            status = {s["device"]: hypr_devices.scanner_status(s["device"])
+                      for s in found}
+            GLib.idle_add(self.apply_scanners, found, status)
         threading.Thread(target=work, daemon=True).start()
         return True
 
-    def apply_scanners(self, found):
+    def apply_scanners(self, found, status=None):
         import time
         self.looking = False
         self.scanners = found
+        self.scan_status = status or {}
         self.scanned_at = time.time()
         self.refresh()
         return False
@@ -1100,6 +1158,8 @@ def main():
         GLib.timeout_add_seconds(config["probe_seconds"], widget.probe_devices)
         GLib.timeout_add_seconds(config["scanner_seconds"],
                                  widget.find_scanners)
+        GLib.timeout_add_seconds(config["sensor_seconds"],
+                                 widget.refresh_scan_status)
     try:
         loop.run()
     finally:
