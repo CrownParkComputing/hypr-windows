@@ -374,6 +374,8 @@ class WindowMap:
         self.links = {}
         self.scanned_at = 0
         self.device_note = ""
+        self.scanning = False
+        self.looking = False
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -673,9 +675,10 @@ class WindowMap:
         name.add_css_class("ws-name")
         head.append(name)
         head.append(Gtk.Box(hexpand=True))
-        again = Gtk.Button(label="scan")
+        again = Gtk.Button(label="looking..." if self.looking else "refresh")
         again.add_css_class("device-button")
         again.set_tooltip_text("look for printers and scanners again")
+        again.set_sensitive(not self.looking)
         again.connect("clicked", lambda *_: self.refresh_devices(force=True))
         head.append(again)
         section.append(head)
@@ -692,12 +695,21 @@ class WindowMap:
             title.set_ellipsize(3)
             title.set_max_width_chars(26)
             row.append(title)
-            meta = Gtk.Label(label="scanner - click to scan", xalign=0.0)
+            meta = Gtk.Label(
+                label="%s %s, %d dpi" % (self.config["scan_source"].lower(),
+                                         self.config["scan_mode"].lower(),
+                                         self.config["scan_dpi"]),
+                xalign=0.0)
             meta.add_css_class("device-meta")
             row.append(meta)
-            click = Gtk.GestureClick()
-            click.connect("released", self.on_scan, scanner["device"])
-            row.add_controller(click)
+            buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            scan = Gtk.Button(label="scanning..." if self.scanning else "scan")
+            scan.add_css_class("device-button")
+            scan.set_sensitive(not self.scanning)
+            scan.set_tooltip_text("scan every sheet in the feeder to ~/Scans")
+            scan.connect("clicked", self.on_scan, scanner["device"])
+            buttons.append(scan)
+            row.append(buttons)
             section.append(row)
 
         if not self.printers and not self.scanners:
@@ -779,9 +791,10 @@ class WindowMap:
                             GLib.idle_add(self.refresh_devices)),
             daemon=True).start()
 
-    def on_scan(self, _gesture, _n, _x, _y, device):
+    def on_scan(self, _button, device):
         """Scan everything in the feeder, in colour at a sane resolution."""
-        self.device_note = "scanning..."
+        self.scanning = True
+        self.device_note = "scanning - feed the sheets now"
         self.refresh()
 
         def work():
@@ -794,6 +807,7 @@ class WindowMap:
         threading.Thread(target=work, daemon=True).start()
 
     def apply_scan_result(self, note):
+        self.scanning = False
         self.device_note = note
         self.refresh()
         return False
@@ -834,6 +848,11 @@ class WindowMap:
         return False
 
     def find_scanners(self):
+        if self.looking:
+            return True
+        self.looking = True
+        self.refresh()
+
         def work():
             found = hypr_devices.list_scanners()
             GLib.idle_add(self.apply_scanners, found)
@@ -842,6 +861,7 @@ class WindowMap:
 
     def apply_scanners(self, found):
         import time
+        self.looking = False
         self.scanners = found
         self.scanned_at = time.time()
         self.refresh()
