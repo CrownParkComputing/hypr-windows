@@ -290,3 +290,81 @@ def wake(mac, port=9):
         return True, "wake-up sent to %s" % clean
     except (OSError, ValueError) as error:
         return False, str(error)
+
+
+# How CUPS and IPP name trouble, in words worth reading on a panel.
+STATE_REASONS = {
+    "media-empty": "out of paper",
+    "media-needed": "needs paper",
+    "media-jam": "paper jam",
+    "cover-open": "cover open",
+    "door-open": "door open",
+    "input-tray-missing": "tray missing",
+    "marker-supply-empty": "out of ink",
+    "marker-supply-low": "ink low",
+    "marker-waste-full": "waste tank full",
+    "toner-empty": "out of toner",
+    "toner-low": "toner low",
+    "offline-report": "reports itself offline",
+    "connecting-to-device": "connecting",
+    "timed-out": "timed out",
+    "paused": "queue paused",
+    "shutdown": "shut down",
+    "spool-area-full": "spool full",
+    "other": "needs attention",
+}
+
+
+def printer_status(name, timeout=8):
+    """What the queue knows about the printer, the way the scanner's sensors
+    tell you about the scanner.
+
+    Read from the local CUPS queue rather than the device, so it still says
+    something useful when the printer is asleep: CUPS keeps the last state,
+    the reasons it gave and the ink levels it reported. Levels below zero
+    are IPP's way of saying unknown, not an empty cartridge.
+    """
+    text = run(["ipptool", "-tv", "ipp://localhost/printers/%s" % name,
+                "get-printer-attributes.test"], timeout=timeout)
+    attributes = {}
+    for line in text.splitlines():
+        match = re.match(r"\s+([a-z0-9-]+) \([^)]*\) = (.*)$", line)
+        if match:
+            attributes[match.group(1)] = match.group(2).strip()
+
+    state = attributes.get("printer-state", "")
+    reasons = [r.strip() for r in attributes.get("printer-state-reasons", "")
+               .split(",") if r.strip() and r.strip() != "none"]
+    accepting = attributes.get("printer-is-accepting-jobs") == "true"
+    try:
+        queued = int(attributes.get("queued-job-count", "0"))
+    except ValueError:
+        queued = 0
+
+    names = [n.strip() for n in attributes.get("marker-names", "").split(",")
+             if n.strip()]
+    levels = []
+    for value in re.findall(r"-?\d+", attributes.get("marker-levels", "")):
+        levels.append(int(value))
+    inks = [(label, level) for label, level in zip(names, levels) if level >= 0]
+
+    words = []
+    for reason in reasons:
+        key = reason.replace("-warning", "").replace("-error", "")
+        words.append(STATE_REASONS.get(key, key.replace("-", " ")))
+    if state == "processing":
+        words.insert(0, "printing")
+    elif state == "stopped":
+        words.insert(0, "stopped")
+    if not accepting:
+        words.append("not accepting jobs")
+    if queued:
+        words.append("%d job%s waiting" % (queued, "" if queued == 1 else "s"))
+
+    ready = state == "idle" and accepting and not reasons
+    return {
+        "ready": ready,
+        "text": ", ".join(words) if words else ("ready" if ready else state),
+        "inks": inks,
+        "queued": queued,
+    }

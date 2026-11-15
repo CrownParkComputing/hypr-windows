@@ -320,6 +320,8 @@ def css(colors):
     .ws-drop { background: alpha(%(primary_container)s, 0.9); }
     .ws-name { color: %(outline)s; font-size: 11px; font-weight: bold; }
     .devices-title { color: %(primary)s; font-size: 13px; font-weight: bold; }
+    levelbar block.filled { background: %(primary)s; border-radius: 2px; }
+    levelbar trough { background: alpha(%(outline)s, 0.25); border-radius: 2px; }
     .ws-name-active { color: %(primary)s; }
     .chip {
         background: %(surface_container_high)s;
@@ -382,6 +384,7 @@ class WindowMap:
         self.looking = False
         self.scan_options = {}       # device -> what the backend offers
         self.scan_status = {}        # device -> what its sensors say
+        self.printer_status = {}     # printer -> what its queue reports
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -800,19 +803,37 @@ class WindowMap:
         top.append(badge)
         row.append(top)
 
-        jobs = len(printer["jobs"])
-        state = printer["state"]
-        if not printer["accepting"]:
-            state += ", not accepting"
-        meta = Gtk.Label(
-            label="%s%s%s" % (
-                state,
-                "" if not jobs else "  -  %d job%s" % (jobs, "" if jobs == 1 else "s"),
-                "" if printer["default"] else ""),
+        status = self.printer_status.get(printer["name"], {})
+        jobs = status.get("queued", len(printer["jobs"]))
+        words = status.get("text") or printer["state"]
+        # Two different facts live on this card: what the queue says and
+        # whether the device answers. A queue that is ready for a printer
+        # that is not there is not "ready" in any sense worth painting green.
+        reachable = link in ("online", "local")
+        good = bool(status.get("ready")) and reachable
+        line = Gtk.Label(
+            label="%s queue %s" % ("\u25cf" if good else "\u25cb", words),
             xalign=0.0)
-        meta.add_css_class("device-meta")
-        meta.set_ellipsize(3)
-        row.append(meta)
+        line.add_css_class("device-ok" if good else
+                           ("device-bad" if not status.get("ready")
+                            else "device-meta"))
+        line.set_wrap(True)
+        line.set_max_width_chars(30)
+        row.append(line)
+
+        for marker, level in status.get("inks", []):
+            ink = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            label = Gtk.Label(label="%s %d%%" % (marker, level), xalign=0.0)
+            label.add_css_class("device-meta")
+            label.set_size_request(110, -1)
+            ink.append(label)
+            bar = Gtk.LevelBar()
+            bar.set_min_value(0)
+            bar.set_max_value(100)
+            bar.set_value(max(0, min(100, level)))
+            bar.set_hexpand(True)
+            ink.append(bar)
+            row.append(ink)
 
         buttons = Gtk.FlowBox()
         buttons.set_selection_mode(Gtk.SelectionMode.NONE)
@@ -930,16 +951,19 @@ class WindowMap:
         """Local CUPS state now; the slow probes on their own schedules."""
         def work():
             printers = hypr_devices.read_queue()
-            GLib.idle_add(self.apply_devices, printers)
+            status = {p["name"]: hypr_devices.printer_status(p["name"])
+                      for p in printers}
+            GLib.idle_add(self.apply_devices, printers, status)
         threading.Thread(target=work, daemon=True).start()
         if force:
             self.probe_devices()
             self.find_scanners()
         return True
 
-    def apply_devices(self, printers):
+    def apply_devices(self, printers, status=None):
         fresh = {p["name"] for p in printers} - set(self.links)
         self.printers = printers
+        self.printer_status = status or {}
         self.refresh()
         if fresh:
             # Chain the first probe to the queue landing: fired alongside it,
