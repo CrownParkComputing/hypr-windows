@@ -119,7 +119,10 @@ DEFAULTS = {
     "all_workspaces": False,  # False: only workspaces holding windows (plus
                               # the active one and one spare to drag into)
     "devices": True,        # printers and scanners at the end of the list
-    "scan_source": "ADF Front",   # ADF Front | ADF Back | ADF Duplex | Flatbed
+    "scan_source": "ADF Duplex",  # ADF Front | ADF Back | ADF Duplex | Flatbed
+                                  # Duplex by default: on a two-sided feeder
+                                  # it costs nothing and means a page fed
+                                  # face-down still comes back readable
     "scan_mode": "Color",         # Color | Gray | Lineart
     "scan_dpi": 300,              # the backend's own default of 600 is rarely
                                   # what you want: 5096x6600 per page
@@ -348,6 +351,15 @@ def css(colors):
     .device-meta { color: %(outline)s; font-size: 12px; }
     .device-bad { color: %(error)s; font-size: 12px; font-weight: bold; }
     .device-ok { color: %(tertiary)s; font-size: 12px; font-weight: bold; }
+    .pill {
+        font-size: 12px;
+        font-weight: bold;
+        border-radius: 8px;
+        padding: 2px 8px;
+    }
+    .pill-ok { background: %(tertiary)s; color: %(surface)s; }
+    .pill-bad { background: %(error)s; color: %(surface)s; }
+    .pill-idle { background: alpha(%(outline)s, 0.35); color: %(on_surface)s; }
     .device-button {
         background: %(surface_container_high)s;
         color: %(on_surface)s;
@@ -706,13 +718,13 @@ class WindowMap:
             row.append(title)
             status = self.scan_status.get(scanner["device"], {})
             if status.get("text"):
-                line = Gtk.Label(
-                    label="%s %s" % ("\u25cf" if status.get("ready") else
-                                     "\u25cb", status["text"]),
-                    xalign=0.0)
-                line.add_css_class("device-ok" if status.get("ready")
-                                   else "device-bad")
-                row.append(line)
+                line = Gtk.Label(label=status["text"], xalign=0.0)
+                line.add_css_class("pill")
+                line.add_css_class("pill-ok" if status.get("ready")
+                                   else "pill-bad")
+                holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+                holder.append(line)
+                row.append(holder)
             meta = Gtk.Label(
                 label="%s %s, %d dpi" % (self.config["scan_source"].lower(),
                                          self.config["scan_mode"].lower(),
@@ -788,12 +800,14 @@ class WindowMap:
         name.set_hexpand(True)
         top.append(name)
         link = self.links.get(printer["name"])
-        mark = {"online": "on", "absent": "off / not on network",
-                "refused": "no answer", "local": "usb"}.get(link, "checking")
+        # Kept short: the dock is 300px and the explanation is in the tooltip.
+        mark = {"online": "on", "absent": "off", "refused": "no answer",
+                "local": "usb"}.get(link, "checking")
         good = link in ("online", "local")
-        badge = Gtk.Label(label="%s %s" % ("\u25cf" if link else "\u25cb", mark))
-        badge.add_css_class("device-ok" if good else
-                            ("device-bad" if link else "device-meta"))
+        badge = Gtk.Label(label=mark)
+        badge.add_css_class("pill")
+        badge.add_css_class("pill-ok" if good else
+                            ("pill-bad" if link else "pill-idle"))
         badge.set_tooltip_text(
             {"absent": "its name does not resolve: the device is not on the "
                        "network. Switch it on, or join the network it is on.",
@@ -811,15 +825,16 @@ class WindowMap:
         # that is not there is not "ready" in any sense worth painting green.
         reachable = link in ("online", "local")
         good = bool(status.get("ready")) and reachable
-        line = Gtk.Label(
-            label="%s queue %s" % ("\u25cf" if good else "\u25cb", words),
-            xalign=0.0)
-        line.add_css_class("device-ok" if good else
-                           ("device-bad" if not status.get("ready")
-                            else "device-meta"))
+        line = Gtk.Label(label="queue %s" % words, xalign=0.0)
+        line.add_css_class("pill")
+        line.add_css_class("pill-ok" if good else
+                           ("pill-bad" if not status.get("ready")
+                            else "pill-idle"))
         line.set_wrap(True)
-        line.set_max_width_chars(30)
-        row.append(line)
+        line.set_max_width_chars(28)
+        holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        holder.append(line)       # so the pill hugs its text
+        row.append(holder)
 
         for marker, level in status.get("inks", []):
             ink = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
