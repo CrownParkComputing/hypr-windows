@@ -510,13 +510,20 @@ def _volume(node, hints, parent):
     }
 
 
-def list_drives(fixed=False):
+def list_drives(fixed=False, keep=()):
     """Block devices grouped by the thing you plug in.
 
     `fixed` widens it from "removable, plus anything mounted under /mnt or
     /run/media" to every disk in the machine. The narrow default is what
     keeps a 300px dock readable: this machine has ten mountable volumes and
     only four of them are ones you would ever touch.
+
+    `keep` names paths to list whatever the filter says. A drive that has
+    just been powered off is the case: udisks drops its Drive object while
+    the device node is still there, so for the moment between the eject and
+    the kernel removing it, it is no longer removable and no longer mounted
+    - it would silently fall out of the list it was just in and reappear
+    under "all", which reads as the eject having gone wrong.
     """
     columns = ("NAME,PATH,TYPE,SIZE,FSTYPE,LABEL,PARTLABEL,MOUNTPOINTS,RM,"
                "HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,FSSIZE,FSUSED,FSAVAIL,RO")
@@ -568,14 +575,14 @@ def list_drives(fixed=False):
             if hints.get(child.get("path") or "", {}).get("HintIgnore"):
                 continue
             group["volumes"].append(_volume(child, hints, group))
-        if not group["volumes"]:
+        if not group["volumes"] and group["path"] not in keep:
             continue
         if (kind == "loop" and not fixed
                 and not any(v["mount"] for v in group["volumes"])):
             continue                  # a backing image nobody is looking at
-        keep = (removable
-                or any(v["external"] for v in group["volumes"]))
-        if fixed or keep:
+        wanted = (removable or group["path"] in keep
+                  or any(v["external"] for v in group["volumes"]))
+        if fixed or wanted:
             groups.append(group)
     return groups
 

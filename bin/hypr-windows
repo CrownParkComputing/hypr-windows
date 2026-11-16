@@ -507,8 +507,12 @@ class WindowMap:
         self.printer_status = {}     # printer -> what its queue reports
         self.drives = []             # disks, grouped by the thing you plug in
         self.drive_busy = set()      # paths with an operation in flight
+        self.ejected = set()         # powered off, waiting to be unplugged
         self.drive_note = ""         # what the last mount or eject reported
         self.drive_pending = 0       # debounce timer for a burst of udev
+        self.section_state = None    # what the pinned sections last drew
+        self.layout = None           # which windows sat where, last redraw
+        self.chips = {}              # address -> (title label, chip box)
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -747,7 +751,18 @@ class WindowMap:
             self.hide_now()
 
     # -- data ---------------------------------------------------------------
-    def refresh(self):
+    def refresh_windows(self):
+        """What a compositor event changes: the window map, nothing else.
+
+        Hyprland sends a windowtitle event every time any title changes, and
+        a terminal with a clock or an FPS counter in its title sends ten a
+        second. Rebuilding the drives and printers on each one destroyed the
+        widget under the pointer mid-click, so most presses on them never
+        became a click at all - the section headings looked simply broken.
+        """
+        return self.refresh(sections=False)
+
+    def refresh(self, sections=True):
         self.pending = 0
         clients = hypr_json("clients") or []
         monitors = hypr_json("monitors") or []
@@ -796,6 +811,32 @@ class WindowMap:
             keys.append(spare)
         keys += sorted(k for k in grouped if isinstance(k, str))
 
+        # Which windows are where, ignoring what they are called. If only
+        # the titles moved, the chips are still the right chips: relabel
+        # them where they stand rather than building new ones, so a click
+        # in progress survives.
+        signature = (tuple(str(k) for k in keys), focused_address,
+                     tuple(sorted(active_ids)), tuple(sorted(active_special)),
+                     tuple(tuple(c.get("address") for c in grouped.get(k, []))
+                           for k in keys))
+        if signature == self.layout and self.chips:
+            for client in clients:
+                entry = self.chips.get(client.get("address"))
+                if entry is None:
+                    continue
+                label, chip = entry
+                title = str(client.get("title") or "")
+                if label.get_text() != title:
+                    label.set_text(title)
+                    chip.set_tooltip_text(
+                        "%s\n%s\n\nclick to go to it, drag to a workspace, "
+                        "X to close" % (client.get("class") or "?", title))
+            if sections:
+                self.refresh_sections()
+            return
+        self.layout = signature
+        self.chips = {}
+
         child = self.columns.get_first_child()
         while child:
             nxt = child.get_next_sibling()
@@ -805,6 +846,51 @@ class WindowMap:
             self.columns.append(self.build_section(
                 key, grouped.get(key, []), active_ids, active_special,
                 focused_address))
+        if sections:
+            self.refresh_sections()
+
+    def drawn_drives(self):
+        """The drives as the cards show them, free space already rounded."""
+        return [(g["path"], g["bus"], g["model"], g["kind"], g["removable"],
+                 g["can_power_off"],
+                 [(v["path"], v["label"], v["fstype"], v["size"], v["mount"],
+                   v["extra_mounts"], v["readonly"], v["system"],
+                   v["protected"],
+                   round(100.0 * (v["used"] or 0) / v["fssize"])
+                   if v["mount"] and v["fssize"] else None,
+                   hypr_devices.human(v["avail"]) if v["mount"] else None)
+                  for v in g["volumes"]])
+                for g in self.drives]
+
+    def refresh_sections(self):
+        """Rebuild the pinned sections - only when their own state moves.
+
+        The polls are the point: the CUPS queue is re-read every 15s and
+        the disks every 30s, and nearly every time they find exactly what
+        they found before. Rebuilding on an unchanged answer destroys the
+        widget under the pointer for nothing, and a click that straddles
+        the rebuild never becomes a click.
+
+        The pinned boxes are what make skipping safe. Along the top or
+        bottom the sections live in `columns`, which a window redraw has
+        just emptied, so there they must always be built again.
+        """
+        pinned = self.drives_box is not None or self.devices_box is not None
+        state = repr((
+            self.drawn_drives(), self.printers, self.printer_status,
+            self.links, self.scanners,
+            # Sensor dictionaries jitter and free space changes with every
+            # write; neither moves what is on the card. Compare what is
+            # drawn, or the guard never holds.
+            {d: (v.get("text"), v.get("ready"))
+             for d, v in self.scan_status.items()},
+            self.device_note, self.drive_note, self.looking, self.scanning,
+            sorted(self.drive_busy), self.profile(),
+            [self.config[k] for k in ("drives", "drives_open", "drives_fixed",
+                                      "devices", "devices_open")]))
+        if pinned and state == self.section_state:
+            return
+        self.section_state = state
         if self.config["drives"]:
             self.fill(self.drives_box, self.build_drives())
         if self.config["devices"]:
@@ -836,20 +922,28 @@ class WindowMap:
         label = "%s  %s" % ("\u25be" if open_now else "\u25b8", title)
         if not open_now and count:
             label += "  %d" % count
-        toggle = Gtk.Button(label=label)
+        # The whole row folds, not just the six characters of the word. A
+        # button sized to its label leaves most of a 300px heading dead to
+        # the pointer, and a heading that ignores a click on itself reads
+        # as broken - which is exactly how it read.
+        text = Gtk.Label(label=label, xalign=0.0)
+        text.set_hexpand(True)
+        toggle = Gtk.Button()
+        toggle.set_child(text)
+        toggle.set_hexpand(True)
+        toggle.set_halign(Gtk.Align.FILL)
         toggle.add_css_class("devices-title")
         toggle.add_css_class("section-head")
         toggle.set_tooltip_text("fold this section away" if open_now
                                 else "show %s again" % title.lower())
         toggle.connect("clicked", self.on_section_toggle, key)
         head.append(toggle)
-        head.append(Gtk.Box(hexpand=True))
         return head
 
     def on_section_toggle(self, _button, key):
         self.config[key] = not self.config[key]
         save_config(self.config)
-        self.refresh()
+        self.refresh_sections()
 
     # -- drives -------------------------------------------------------------
     def build_drives(self):
@@ -922,6 +1016,18 @@ class WindowMap:
                                 ", removable" if group["removable"] else ""))
         top.append(bus)
         row.append(top)
+
+        gone = group["path"] in self.ejected
+        if gone:
+            # Powered off and still enumerated. Nothing here can be mounted
+            # or ejected again; the only thing left to do is unplug it.
+            told = Gtk.Label(label="ejected - safe to unplug", xalign=0.0)
+            told.add_css_class("pill")
+            told.add_css_class("pill-idle")
+            holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            holder.append(told)
+            row.append(holder)
+            return row
 
         eject = None
         loop = group["kind"] == "loop"
@@ -1054,7 +1160,7 @@ class WindowMap:
         self.drive_busy.add(path)
         self.drive_note = "%s %s..." % ("unmounting" if mounted else "mounting",
                                         os.path.basename(path))
-        self.refresh()
+        self.refresh_sections()
 
         def work():
             done, message = ((hypr_devices.unmount(path)) if mounted
@@ -1067,7 +1173,7 @@ class WindowMap:
         path = group["path"]
         self.drive_busy.add(path)
         self.drive_note = "ejecting %s..." % os.path.basename(path)
-        self.refresh()
+        self.refresh_sections()
         mounts = [v["path"] for v in group["volumes"] if v["mount"]]
         loop = group["kind"] == "loop"
 
@@ -1080,6 +1186,8 @@ class WindowMap:
                     return
             done, message = (hypr_devices.loop_delete(path) if loop
                              else hypr_devices.power_off(path))
+            if done:
+                GLib.idle_add(self.ejected.add, path)
             GLib.idle_add(self.apply_drive_result, path, done, message)
         threading.Thread(target=work, daemon=True).start()
 
@@ -1092,14 +1200,22 @@ class WindowMap:
     # -- drive state --------------------------------------------------------
     def refresh_drives(self):
         def work():
-            found = hypr_devices.list_drives(self.config["drives_fixed"])
+            found = hypr_devices.list_drives(self.config["drives_fixed"],
+                                             keep=tuple(self.ejected))
             GLib.idle_add(self.apply_drives, found)
         threading.Thread(target=work, daemon=True).start()
         return True
 
     def apply_drives(self, found):
         self.drives = found
-        self.refresh()
+        here = {g["path"] for g in found}
+        # Unplugged at last, or plugged back in and mounted: either way it
+        # is no longer a drive waiting to be pulled out.
+        self.ejected = {p for p in self.ejected
+                        if p in here and not any(
+                            v["mount"] for g in found if g["path"] == p
+                            for v in g["volumes"])}
+        self.refresh_sections()
         return False
 
     def schedule_drives(self):
@@ -1384,7 +1500,7 @@ class WindowMap:
 
     def on_wake(self, _button, uri):
         self.device_note = "waking..."
-        self.refresh()
+        self.refresh_sections()
 
         def work():
             mac = hypr_devices.device_mac(uri)
@@ -1403,7 +1519,7 @@ class WindowMap:
         """Scan everything in the feeder, in colour at a sane resolution."""
         self.scanning = True
         self.device_note = "scanning - feed the sheets now"
-        self.refresh()
+        self.refresh_sections()
 
         entry = self.profile()
         folder = self.profile_folder(entry)
@@ -1429,7 +1545,7 @@ class WindowMap:
         options = self.scan_options.get(device)
         if not options:
             self.device_note = "asking the scanner what it supports..."
-            self.refresh()
+            self.refresh_sections()
 
             def work():
                 found = hypr_devices.scanner_options(device)
@@ -1454,7 +1570,7 @@ class WindowMap:
             if current in values else (values[0] if values else current)
         entry[field] = int(nxt) if key == "resolution" else nxt
         save_config(self.config)
-        self.refresh()
+        self.refresh_sections()
 
     def on_cycle_profile(self, _button):
         names = [e.get("name") for e in self.config["scan_profiles"]]
@@ -1463,7 +1579,7 @@ class WindowMap:
             (names.index(current) + 1) % len(names)] if current in names \
             else names[0]
         save_config(self.config)
-        self.refresh()
+        self.refresh_sections()
 
     def on_open_folder(self, _button):
         folder = self.profile_folder()
@@ -1475,7 +1591,7 @@ class WindowMap:
     def apply_scan_result(self, note):
         self.scanning = False
         self.device_note = note
-        self.refresh()
+        self.refresh_sections()
         # The feeder is emptier than it was: re-read the sensors.
         self.find_scanners()
         return False
@@ -1497,7 +1613,7 @@ class WindowMap:
         fresh = {p["name"] for p in printers} - set(self.links)
         self.printers = printers
         self.printer_status = status or {}
-        self.refresh()
+        self.refresh_sections()
         if fresh:
             # Chain the first probe to the queue landing: fired alongside it,
             # it would run against an empty list and leave every printer
@@ -1515,7 +1631,7 @@ class WindowMap:
 
     def apply_links(self, links):
         self.links = links
-        self.refresh()
+        self.refresh_sections()
         return False
 
     def refresh_scan_status(self):
@@ -1524,7 +1640,7 @@ class WindowMap:
             # Longer than the backend's own timeout: nothing is coming back.
             self.scanning = False
             self.device_note = "scan timed out"
-            self.refresh()
+            self.refresh_sections()
         if not self.scanners or self.scanning:
             return True
 
@@ -1538,7 +1654,7 @@ class WindowMap:
     def apply_scan_status(self, status):
         if status != self.scan_status:
             self.scan_status = status
-            self.refresh()
+            self.refresh_sections()
         if self.config["scan_button"] and not self.scanning:
             # The Scan button on the machine: the backend cannot light it,
             # but it can tell us it was pressed, so pressing it does the
@@ -1557,7 +1673,7 @@ class WindowMap:
         if self.looking:
             return True
         self.looking = True
-        self.refresh()
+        self.refresh_sections()
 
         def work():
             found = hypr_devices.list_scanners()
@@ -1572,7 +1688,7 @@ class WindowMap:
         self.scanners = found
         self.scan_status = status or {}
         self.scanned_at = time.time()
-        self.refresh()
+        self.refresh_sections()
         return False
 
     def build_section(self, key, windows, active_ids, active_special, focused):
@@ -1652,6 +1768,8 @@ class WindowMap:
         close.connect("clicked", self.on_close_clicked, address)
         chip.append(close)
 
+        self.chips[address] = (name, chip)
+
         source = Gtk.DragSource()
         source.set_actions(Gdk.DragAction.MOVE)
         source.connect("prepare", self.on_drag_prepare, address)
@@ -1692,7 +1810,7 @@ class WindowMap:
         """Collapse the burst of events one action produces into one redraw."""
         if self.pending:
             GLib.source_remove(self.pending)
-        self.pending = GLib.timeout_add(delay, self.refresh)
+        self.pending = GLib.timeout_add(delay, self.refresh_windows)
 
     def watch_events(self):
         signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
