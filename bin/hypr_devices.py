@@ -8,6 +8,7 @@ Call all of it from a worker thread.
 """
 
 import glob
+import json
 import os
 import re
 import socket
@@ -370,3 +371,266 @@ def printer_status(name, timeout=8):
         "inks": inks,
         "queued": queued,
     }
+
+
+# -------------------------------------------------------------------- disks --
+# Everything below is about block devices: what is attached, what is mounted,
+# and what this session is allowed to mount without being asked for a
+# password. udisks answers all three and is cheap to ask - a full dump is
+# ~25ms - so unlike the printers there is nothing here that needs a long
+# timeout. It is still called from a worker thread for consistency.
+
+# Mount points the dock will not offer to unmount: pulling any of these out
+# from under a running session is not a thing a button should make easy.
+PROTECTED = ("/", "/boot", "/efi", "/usr", "/var", "/etc", "/srv", "/root",
+             "/home", "/nix", "/opt", "/proc", "/sys", "[SWAP]")
+
+# Where a volume has to be mounted to count as "something you plugged in"
+# rather than part of the installed system.
+EXTERNAL_ROOTS = ("/run/media/", "/media/", "/mnt/")
+
+
+def run_full(args, timeout=25):
+    """Like run(), but keeps the exit code and whatever went to stderr.
+
+    Mounting reports its failures on stderr and says nothing on stdout, so
+    the plain run() would turn every refusal into silence.
+    """
+    try:
+        done = subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout)
+        text = (done.stdout or "") + (done.stderr or "")
+        return done.returncode, text.strip()
+    except subprocess.TimeoutExpired:
+        return 1, "%s timed out" % args[0]
+    except (subprocess.SubprocessError, OSError) as error:
+        return 1, str(error)
+
+
+def human(size):
+    """Bytes as a panel-width string: 3.6T, 931G, 4.0G, 200M."""
+    try:
+        size = float(size)
+    except (TypeError, ValueError):
+        return "-"
+    for unit, step in (("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20),
+                       ("K", 1 << 10)):
+        if size >= step:
+            value = size / step
+            return "%.1f%s" % (value, unit) if value < 10 else \
+                   "%d%s" % (round(value), unit)
+    return "%dB" % size
+
+
+def udisks_hints():
+    """Per-device hints from one `udisksctl dump`.
+
+    The one that matters is HintSystem. udisks sets it for anything that
+    looks like part of the installed system - a disk that is not removable,
+    or a volume named in fstab - and polkit's default rules only let an
+    active local session mount and unmount devices *without* it. So this
+    flag is not decoration: it is the difference between a button that works
+    and a button that returns NotAuthorized unless a polkit agent is running
+    to ask for a password.
+    """
+    blocks, drives, current, device = {}, {}, None, None
+    for line in run(["udisksctl", "dump"], timeout=10).splitlines():
+        if line.startswith("/org/freedesktop/UDisks2/"):
+            current = line.rstrip(":")
+            device = None
+            continue
+        if current is None:
+            continue
+        name, _, value = line.strip().partition(":")
+        value = value.strip()
+        if "/drives/" in current:
+            if name in ("ConnectionBus", "Ejectable", "CanPowerOff",
+                        "Removable", "Optical", "MediaAvailable", "Model",
+                        "Vendor"):
+                entry = drives.setdefault(current, {})
+                entry[name] = (value == "true" if value in ("true", "false")
+                               else value)
+            continue
+        if "/block_devices/" not in current:
+            continue
+        if name == "Device":
+            device = value
+            blocks.setdefault(device, {})
+        elif device and name in ("HintSystem", "HintIgnore", "HintAuto"):
+            blocks[device][name] = value == "true"
+        elif device and name == "Drive":
+            blocks[device]["Drive"] = value.strip("'")
+    return blocks, drives
+
+
+def _under(mount, root):
+    """Is this mount point that path, or inside it?
+
+    Spelt out because "/" is a prefix of every path on the system: a plain
+    startswith() would make every mount look like the root filesystem.
+    """
+    return mount == root or (root != "/" and
+                             mount.startswith(root.rstrip("/") + "/"))
+
+
+def _volume(node, hints, parent):
+    """One mountable thing, as the panel thinks of it."""
+    path = node.get("path") or ""
+    hint = hints.get(path, {})
+    mounts = [m for m in (node.get("mountpoints") or []) if m]
+    # btrfs subvolumes give one volume half a dozen mount points; the
+    # shortest is the one worth naming.
+    mount = sorted(mounts, key=len)[0] if mounts else ""
+    # "Basic data partition" is what Windows writes into every GPT entry
+    # it makes: true of a third of the partitions on this machine, and so
+    # no use as a name. Where it is mounted says far more.
+    label = node.get("label") or ""
+    partlabel = (node.get("partlabel") or "").strip()
+    if not label and partlabel.lower() not in ("", "basic data partition"):
+        label = partlabel
+    if not label and mount:
+        label = os.path.basename(mount.rstrip("/")) or mount
+    return {
+        "path": path,
+        "name": node.get("name") or "",
+        "label": label,
+        "fstype": node.get("fstype") or "",
+        "size": node.get("size") or 0,
+        "mount": mount,
+        "mounts": mounts,
+        "extra_mounts": max(0, len(mounts) - 1),
+        "used": node.get("fsused"),
+        "avail": node.get("fsavail"),
+        "fssize": node.get("fssize"),
+        "readonly": bool(node.get("ro")),
+        "system": bool(hint.get("HintSystem", not parent.get("removable"))),
+        "protected": any(_under(m, p) for m in mounts for p in PROTECTED),
+        "external": any(m.startswith(root) for m in mounts
+                        for root in EXTERNAL_ROOTS),
+    }
+
+
+def list_drives(fixed=False):
+    """Block devices grouped by the thing you plug in.
+
+    `fixed` widens it from "removable, plus anything mounted under /mnt or
+    /run/media" to every disk in the machine. The narrow default is what
+    keeps a 300px dock readable: this machine has ten mountable volumes and
+    only four of them are ones you would ever touch.
+    """
+    columns = ("NAME,PATH,TYPE,SIZE,FSTYPE,LABEL,PARTLABEL,MOUNTPOINTS,RM,"
+               "HOTPLUG,TRAN,MODEL,VENDOR,SERIAL,FSSIZE,FSUSED,FSAVAIL,RO")
+    try:
+        tree = json.loads(run(["lsblk", "-J", "-b", "-o", columns],
+                              timeout=10) or "{}")
+    except ValueError:
+        return []
+    hints, drive_info = udisks_hints()
+
+    groups = []
+    for node in tree.get("blockdevices", []):
+        name = node.get("name") or ""
+        kind = node.get("type") or ""
+        children = node.get("children") or []
+        if name.startswith("zram") or kind not in ("disk", "loop"):
+            continue
+        if not node.get("size") and not children:
+            continue                      # an nbd slot with nothing in it
+        bus = node.get("tran") or ("loop" if kind == "loop" else "")
+        hint = hints.get(node.get("path") or "", {})
+        drive = drive_info.get(hint.get("Drive", ""), {})
+        removable = bool(node.get("rm") or node.get("hotplug")
+                         or bus == "usb" or drive.get("Removable"))
+        group = {
+            "path": node.get("path") or "",
+            "name": name,
+            "kind": kind,
+            "bus": bus or (drive.get("ConnectionBus") or ""),
+            "size": node.get("size") or 0,
+            "model": (drive.get("Model") or node.get("model") or "").strip(),
+            "vendor": (drive.get("Vendor") or node.get("vendor") or "").strip(),
+            "removable": removable,
+            "optical": bool(drive.get("Optical")),
+            "can_power_off": bool(drive.get("CanPowerOff")),
+            "ejectable": bool(drive.get("Ejectable")),
+            "volumes": [],
+        }
+        # A disk formatted whole - most USB sticks - is its own volume.
+        for child in (children or [node]):
+            if (child.get("type") or "") not in ("part", "disk", "loop",
+                                                 "crypt", "lvm"):
+                continue
+            mounted = [m for m in (child.get("mountpoints") or []) if m]
+            if not child.get("fstype") and not mounted:
+                continue              # empty or unformatted: nothing to mount
+            if child.get("fstype") == "swap":
+                continue
+            if hints.get(child.get("path") or "", {}).get("HintIgnore"):
+                continue
+            group["volumes"].append(_volume(child, hints, group))
+        if not group["volumes"]:
+            continue
+        if (kind == "loop" and not fixed
+                and not any(v["mount"] for v in group["volumes"])):
+            continue                  # a backing image nobody is looking at
+        keep = (removable
+                or any(v["external"] for v in group["volumes"]))
+        if fixed or keep:
+            groups.append(group)
+    return groups
+
+
+def mount(path):
+    """udisks does the mounting, so it lands where a file manager expects."""
+    code, text = run_full(["udisksctl", "mount", "--no-user-interaction",
+                           "-b", path])
+    if code == 0:
+        where = text.split(" at ", 1)[-1].strip(" .") if " at " in text else ""
+        return True, "mounted%s" % (" at %s" % where if where else "")
+    return False, _why(text, path)
+
+
+def unmount(path):
+    code, text = run_full(["udisksctl", "unmount", "--no-user-interaction",
+                           "-b", path])
+    if code == 0:
+        return True, "%s unmounted" % os.path.basename(path)
+    return False, _why(text, path)
+
+
+def power_off(path):
+    """Spin a USB disk down so it is safe to pull out."""
+    code, text = run_full(["udisksctl", "power-off", "--no-user-interaction",
+                           "-b", path])
+    if code == 0:
+        return True, "safe to unplug"
+    return False, _why(text, path)
+
+
+def loop_delete(path):
+    """Detach a loop device - the eject of a file-backed disk."""
+    code, text = run_full(["udisksctl", "loop-delete",
+                           "--no-user-interaction", "-b", path])
+    if code == 0:
+        return True, "%s detached" % os.path.basename(path)
+    return False, _why(text, path)
+
+
+def _why(text, path):
+    """Turn a D-Bus error into something worth reading on a panel."""
+    name = os.path.basename(path)
+    if "NotAuthorized.CanObtain" in text or "DismissedAuthorization" in text:
+        return ("%s needs authorisation and no polkit agent is running "
+                "(start hyprpolkitagent)" % name)
+    if "NotAuthorized" in text:
+        return "not allowed to do that to %s" % name
+    if "target is busy" in text or "TargetBusy" in text:
+        return "%s is in use - close what is reading it" % name
+    if "AlreadyMounted" in text:
+        return "%s is already mounted" % name
+    if "NotMounted" in text:
+        return "%s is not mounted" % name
+    if "No such interface" in text or "not a mountable" in text:
+        return "%s has no filesystem to mount" % name
+    tail = text.rsplit(":", 1)[-1].strip()
+    return tail[:120] or "could not do that to %s" % name

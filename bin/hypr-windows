@@ -31,6 +31,7 @@ if not os.environ.get("HYPR_WINDOWS_PRELOAD") and os.path.exists(_PRELOAD):
     os.execv(sys.executable,
              [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
+import colorsys  # noqa: E402
 import fcntl  # noqa: E402
 import json  # noqa: E402
 import signal  # noqa: E402
@@ -119,6 +120,13 @@ DEFAULTS = {
     "trigger_px": 4,        # thickness of the edge strip that pops it in
     "all_workspaces": False,  # False: only workspaces holding windows (plus
                               # the active one and one spare to drag into)
+    "ws_colors": True,      # a colour per desktop, spun off the accent
+    "drives": True,         # disks and sticks you can mount from the dock
+    "drives_fixed": False,  # True also lists the machine's own disks, not
+                            # just what is removable or mounted under /mnt
+    "drives_seconds": 30,   # a safety net re-read; hotplug arrives by udev
+    "drives_open": True,    # False folds the section to its heading
+    "devices_open": True,   # the same for the printers and scanners
     "devices": True,        # printers and scanners at the end of the list
     # What you are scanning decides where it goes and how it is read. Each
     # profile is a folder plus the settings that suit that kind of paper:
@@ -304,6 +312,48 @@ def palette():
     return colors
 
 
+def ws_colors(colors, count=9):
+    """One colour per workspace, spun off the palette's own accent.
+
+    A fixed set of nine colours would fight the wallpaper every time the
+    rice re-themes, so the ring starts at the primary's hue and walks round
+    the wheel from there: workspace 1 always looks like the rest of the
+    dock, and the others are recognisably its neighbours rather than a
+    different design. Saturation and value are floored because a palette
+    pulled from a washed-out wallpaper can be nearly grey, and nine shades
+    of the same grey is not a colour code.
+    """
+    try:
+        raw = colors["primary"].lstrip("#")
+        base = tuple(int(raw[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except (KeyError, ValueError):
+        base = (0.85, 0.78, 0.44)
+    hue, sat, val = colorsys.rgb_to_hsv(*base)
+    sat = min(0.72, max(0.50, sat))
+    val = min(0.95, max(0.80, val))
+    ring = []
+    for index in range(count):
+        tone = colorsys.hsv_to_rgb((hue + index / float(count)) % 1.0,
+                                   sat, val)
+        ring.append("#%02x%02x%02x" % tuple(round(c * 255) for c in tone))
+    return ring
+
+
+def ws_css(colors, count=9):
+    """Paint the ring: the number, the active border, the focused chip."""
+    rules = []
+    for index, tone in enumerate(ws_colors(colors, count)):
+        rules.append("""
+    .ws-c%(index)d .ws-name { color: %(tone)s; background: alpha(%(tone)s, 0.18); }
+    .ws-c%(index)d.ws-active { border-color: %(tone)s; }
+    .ws-c%(index)d .ws-name-active { background: %(tone)s; color: %(surface)s; }
+    .ws-c%(index)d .chip:hover { background: alpha(%(tone)s, 0.30); }
+    .ws-c%(index)d .chip-focused { background: alpha(%(tone)s, 0.30); }
+    .ws-c%(index)d .chip-class { color: %(tone)s; }
+    """ % {"index": index, "tone": tone, "surface": colors["surface"]})
+    return "".join(rules)
+
+
 def css(colors):
     return """
     window.panel { background: transparent; }
@@ -340,7 +390,13 @@ def css(colors):
     }
     .ws-active { border-color: %(primary)s; }
     .ws-drop { background: alpha(%(primary_container)s, 0.9); }
-    .ws-name { color: %(outline)s; font-size: 11px; font-weight: bold; }
+    .ws-name {
+        color: %(outline)s;
+        font-size: 11px;
+        font-weight: bold;
+        border-radius: 7px;
+        padding: 1px 8px;
+    }
     .devices-title { color: %(primary)s; font-size: 13px; font-weight: bold; }
     levelbar block.filled { background: %(primary)s; border-radius: 2px; }
     levelbar trough { background: alpha(%(outline)s, 0.25); border-radius: 2px; }
@@ -376,6 +432,22 @@ def css(colors):
         border-radius: 8px;
         padding: 2px 8px;
     }
+    button.section-head {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0 2px;
+        min-height: 0;
+        min-width: 0;
+    }
+    button.section-head:hover { color: %(on_surface)s; }
+    button.pill {
+        border: none;
+        min-height: 0;
+        min-width: 0;
+        box-shadow: none;
+    }
+    button.pill:hover { box-shadow: 0 0 0 1px %(on_surface)s inset; }
     .pill-ok { background: %(tertiary)s; color: %(surface)s; }
     .pill-bad { background: %(error)s; color: %(surface)s; }
     .pill-idle { background: alpha(%(outline)s, 0.35); color: %(on_surface)s; }
@@ -384,7 +456,11 @@ def css(colors):
         color: %(on_surface)s;
         border: none;
         border-radius: 7px;
-        padding: 2px 9px;
+        /* Tight on purpose: at 9px a printer's five buttons come to two
+           pixels more than a 300px dock has, and the fifth - the wake,
+           the one you only ever see when the printer is asleep - drops
+           onto a row of its own. */
+        padding: 2px 7px;
         min-height: 0;
         min-width: 0;
         font-size: 12px;
@@ -392,6 +468,17 @@ def css(colors):
     .device-button:hover { background: %(primary_container)s; color: %(primary)s; }
     .trigger { background: transparent; }
     """ % colors
+
+
+def screen_height():
+    """Pixels on the monitor the dock will open on, or a sane guess."""
+    try:
+        monitors = Gdk.Display.get_default().get_monitors()
+        if monitors.get_n_items():
+            return monitors.get_item(0).get_geometry().height
+    except (AttributeError, TypeError):
+        pass
+    return 1080
 
 
 # -------------------------------------------------------------------- view --
@@ -418,6 +505,10 @@ class WindowMap:
         self.scan_started = 0.0      # when the running scan began
         self.button_was_down = {}    # device -> was its Scan button down
         self.printer_status = {}     # printer -> what its queue reports
+        self.drives = []             # disks, grouped by the thing you plug in
+        self.drive_busy = set()      # paths with an operation in flight
+        self.drive_note = ""         # what the last mount or eject reported
+        self.drive_pending = 0       # debounce timer for a burst of udev
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -482,6 +573,7 @@ class WindowMap:
                          else Gtk.Orientation.HORIZONTAL),
             spacing=(6 if self.vertical else 8))
         self.devices_box = None
+        self.drives_box = None
         if self.vertical:
             # A long window list scrolls rather than pushing the dock off the
             # bottom of the screen.
@@ -489,19 +581,42 @@ class WindowMap:
             scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             scroller.set_child(self.columns)
             body.append(scroller)
-            if config["devices"]:
-                # Pinned below the scroller, so the printers stay put however
-                # many windows are open instead of scrolling out of reach.
+            if config["drives"] or config["devices"]:
+                # Pinned below the scroller, so the drives and printers stay
+                # put however many windows are open instead of scrolling out
+                # of reach. It scrolls on its own once it is crowded: the
+                # window list above gives up its space first, but four
+                # drives, a printer and a scanner will still run off the
+                # bottom of the screen, and whatever lands there is not
+                # merely ugly - it is unreachable.
                 body.append(Gtk.Separator(
                     orientation=Gtk.Orientation.HORIZONTAL))
-                self.devices_box = Gtk.Box(
-                    orientation=Gtk.Orientation.VERTICAL, spacing=5)
-                body.append(self.devices_box)
+                bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                 spacing=5)
+                pinned = Gtk.ScrolledWindow()
+                pinned.set_policy(Gtk.PolicyType.NEVER,
+                                  Gtk.PolicyType.AUTOMATIC)
+                pinned.set_propagate_natural_height(True)
+                pinned.set_max_content_height(int(screen_height() * 0.55))
+                pinned.set_child(bottom)
+                body.append(pinned)
+                if config["drives"]:
+                    self.drives_box = Gtk.Box(
+                        orientation=Gtk.Orientation.VERTICAL, spacing=5)
+                    bottom.append(self.drives_box)
+                if config["devices"]:
+                    self.devices_box = Gtk.Box(
+                        orientation=Gtk.Orientation.VERTICAL, spacing=5)
+                    bottom.append(self.devices_box)
         else:
             body.append(self.columns)
 
+        colors = palette()
+        sheet = css(colors)
+        if config["ws_colors"]:
+            sheet += ws_css(colors)
         provider = Gtk.CssProvider()
-        provider.load_from_data(css(palette()).encode())
+        provider.load_from_data(sheet.encode())
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -690,16 +805,337 @@ class WindowMap:
             self.columns.append(self.build_section(
                 key, grouped.get(key, []), active_ids, active_special,
                 focused_address))
+        if self.config["drives"]:
+            self.fill(self.drives_box, self.build_drives())
         if self.config["devices"]:
-            if self.devices_box is not None:
-                child = self.devices_box.get_first_child()
-                while child:
-                    nxt = child.get_next_sibling()
-                    self.devices_box.remove(child)
-                    child = nxt
-                self.devices_box.append(self.build_devices())
-            else:
-                self.columns.append(self.build_devices())
+            self.fill(self.devices_box, self.build_devices())
+
+    def fill(self, box, widget):
+        """Put a freshly built section in its pinned box, or inline."""
+        if box is None:
+            self.columns.append(widget)
+            return
+        child = box.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            box.remove(child)
+            child = nxt
+        box.append(widget)
+
+    # -- sections -----------------------------------------------------------
+    def section_head(self, title, key, count):
+        """A heading that folds its section away.
+
+        Drives, printers and a scanner together are taller than the strip
+        they live in, and most of the time you want one of them. Folding is
+        per section and is remembered, so a dock set up for printing comes
+        back set up for printing.
+        """
+        open_now = self.config[key]
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        label = "%s  %s" % ("\u25be" if open_now else "\u25b8", title)
+        if not open_now and count:
+            label += "  %d" % count
+        toggle = Gtk.Button(label=label)
+        toggle.add_css_class("devices-title")
+        toggle.add_css_class("section-head")
+        toggle.set_tooltip_text("fold this section away" if open_now
+                                else "show %s again" % title.lower())
+        toggle.connect("clicked", self.on_section_toggle, key)
+        head.append(toggle)
+        head.append(Gtk.Box(hexpand=True))
+        return head
+
+    def on_section_toggle(self, _button, key):
+        self.config[key] = not self.config[key]
+        save_config(self.config)
+        self.refresh()
+
+    # -- drives -------------------------------------------------------------
+    def build_drives(self):
+        """Mountable block devices, grouped by the thing you plug in.
+
+        What the dock can actually do to a drive is not a matter of taste:
+        polkit lets an active local session mount and unmount anything
+        udisks does *not* flag as part of the system, and refuses the rest
+        unless an authentication agent is running to ask for a password. So
+        a fixed disk gets the facts and an Open button; a stick you plugged
+        in gets the buttons that will work.
+        """
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        section.add_css_class("ws")
+
+        head = self.section_head("DRIVES", "drives_open", len(self.drives))
+        section.append(head)
+        if not self.config["drives_open"]:
+            return section
+        scope = Gtk.Button(label="all" if self.config["drives_fixed"]
+                           else "plugged in")
+        scope.add_css_class("device-button")
+        scope.set_tooltip_text(
+            "showing every disk in the machine - click for only what is "
+            "removable or mounted under /mnt"
+            if self.config["drives_fixed"] else
+            "showing what is removable or mounted under /mnt - click for "
+            "every disk in the machine")
+        scope.connect("clicked", self.on_drives_scope)
+        head.append(scope)
+
+        for group in self.drives:
+            section.append(self.drive_card(group))
+        if not self.drives:
+            empty = Gtk.Label(label="nothing plugged in", xalign=0.0)
+            empty.add_css_class("empty")
+            section.append(empty)
+        if self.drive_note:
+            note = Gtk.Label(label=self.drive_note, xalign=0.0)
+            note.add_css_class("device-meta")
+            note.set_wrap(True)
+            note.set_max_width_chars(34)
+            section.append(note)
+        return section
+
+    def drive_card(self, group):
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        row.add_css_class("chip")
+        volumes = group["volumes"]
+        single = len(volumes) == 1
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        # One volume is the usual case - a stick, an external disk - and
+        # then its label is the name worth showing. A partitioned disk is
+        # named by the hardware, with the volumes listed under it.
+        title = ((volumes[0]["label"] or group["model"] or group["name"])
+                 if single else (group["model"] or group["name"]))
+        name = Gtk.Label(label=title, xalign=0.0)
+        name.add_css_class("device-name")
+        name.set_ellipsize(3)
+        name.set_max_width_chars(20)
+        name.set_hexpand(True)
+        top.append(name)
+        bus = Gtk.Label(label=(group["bus"] or "disk"))
+        bus.add_css_class("pill")
+        bus.add_css_class("pill-ok" if group["removable"] else "pill-idle")
+        bus.set_tooltip_text("%s, %s%s"
+                             % (group["path"],
+                                hypr_devices.human(group["size"]),
+                                ", removable" if group["removable"] else ""))
+        top.append(bus)
+        row.append(top)
+
+        eject = None
+        loop = group["kind"] == "loop"
+        # udisks does not call a loop device removable - nothing was plugged
+        # in - but detaching one is the same gesture, and without this the
+        # loop branch below could never be reached.
+        if loop or (group["removable"] and group["can_power_off"]):
+            eject = Gtk.Button(label="detach" if loop else "eject")
+            eject.add_css_class("device-button")
+            eject.set_tooltip_text(
+                "unmount this image and detach the loop device" if loop else
+                "unmount everything on this drive and power it down, so it "
+                "is safe to unplug")
+            eject.set_sensitive(group["path"] not in self.drive_busy)
+            eject.connect("clicked", self.on_drive_eject, group)
+
+        for volume in volumes:
+            # One volume, one button row: a drive you can eject is nearly
+            # always a drive with a single filesystem on it, and giving the
+            # eject a row of its own costs a line of a dock that has none
+            # spare.
+            row.append(self.volume_block(volume, single,
+                                         eject if single else None))
+        if eject is not None and not single:
+            buttons = Gtk.FlowBox()
+            buttons.set_selection_mode(Gtk.SelectionMode.NONE)
+            buttons.set_max_children_per_line(8)
+            buttons.set_column_spacing(4)
+            buttons.insert(eject, -1)
+            row.append(buttons)
+        return row
+
+    def volume_block(self, volume, single, eject=None):
+        block = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        mounted = bool(volume["mount"])
+        busy = volume["path"] in self.drive_busy
+
+        if not single:
+            label = Gtk.Label(label=(volume["label"] or volume["name"]),
+                              xalign=0.0)
+            label.add_css_class("device-name")
+            label.set_ellipsize(3)
+            label.set_max_width_chars(24)
+            block.append(label)
+
+        facts = " · ".join(x for x in (
+            volume["fstype"] or "no filesystem",
+            hypr_devices.human(volume["size"]),
+            "read-only" if volume["readonly"] else "") if x)
+        meta = Gtk.Label(label=facts, xalign=0.0)
+        meta.add_css_class("device-meta")
+        block.append(meta)
+
+        if mounted and volume["fssize"]:
+            used = volume["used"] or 0
+            share = max(0, min(100, round(100.0 * used / volume["fssize"])))
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            text = Gtk.Label(label="%d%%  %s free"
+                             % (share, hypr_devices.human(volume["avail"])),
+                             xalign=0.0)
+            text.add_css_class("device-meta")
+            text.set_size_request(110, -1)
+            line.append(text)
+            bar = Gtk.LevelBar()
+            bar.set_min_value(0)
+            bar.set_max_value(100)
+            bar.set_value(share)
+            bar.set_hexpand(True)
+            line.append(bar)
+            block.append(line)
+
+        where = Gtk.Label(
+            label=(volume["mount"] + ("  +%d more" % volume["extra_mounts"]
+                                      if volume["extra_mounts"] else ""))
+            if mounted else "not mounted", xalign=0.0)
+        where.add_css_class("device-meta" if mounted else "empty")
+        where.set_ellipsize(2)  # PANGO_ELLIPSIZE_MIDDLE: keep both ends
+        where.set_max_width_chars(30)
+        block.append(where)
+
+        buttons = Gtk.FlowBox()
+        buttons.set_selection_mode(Gtk.SelectionMode.NONE)
+        buttons.set_max_children_per_line(8)
+        buttons.set_column_spacing(4)
+        buttons.set_row_spacing(4)
+        if mounted:
+            open_it = Gtk.Button(label="open")
+            open_it.add_css_class("device-button")
+            open_it.set_tooltip_text("open %s in the file manager"
+                                     % volume["mount"])
+            open_it.connect("clicked", self.on_drive_open, volume["mount"])
+            buttons.insert(open_it, -1)
+        action = Gtk.Button(label="working..." if busy else
+                            ("unmount" if mounted else "mount"))
+        action.add_css_class("device-button")
+        action.set_sensitive(not busy and not volume["protected"])
+        if volume["protected"]:
+            action.set_tooltip_text(
+                "%s is part of the running system - the dock will not "
+                "offer to pull it out from under you" % volume["mount"])
+        elif volume["system"]:
+            action.set_tooltip_text(
+                "udisks counts this as a system disk, so this needs "
+                "authorisation: it only works with a polkit agent running "
+                "to ask for the password")
+        else:
+            action.set_tooltip_text(
+                "unmount it, then it is safe to unplug" if mounted
+                else "mount it under /run/media")
+        action.connect("clicked", self.on_drive_action, volume, mounted)
+        buttons.insert(action, -1)
+        if eject is not None:
+            buttons.insert(eject, -1)
+        block.append(buttons)
+        return block
+
+    # -- drive actions ------------------------------------------------------
+    def on_drives_scope(self, _button):
+        self.config["drives_fixed"] = not self.config["drives_fixed"]
+        save_config(self.config)
+        self.refresh_drives()
+
+    def on_drive_open(self, _button, mount):
+        subprocess.Popen(["xdg-open", mount],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def on_drive_action(self, _button, volume, mounted):
+        """Mount or unmount, on a thread: udisks can take a few seconds."""
+        path = volume["path"]
+        self.drive_busy.add(path)
+        self.drive_note = "%s %s..." % ("unmounting" if mounted else "mounting",
+                                        os.path.basename(path))
+        self.refresh()
+
+        def work():
+            done, message = ((hypr_devices.unmount(path)) if mounted
+                             else hypr_devices.mount(path))
+            GLib.idle_add(self.apply_drive_result, path, done, message)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_drive_eject(self, _button, group):
+        """Unmount everything on the drive, then spin it down."""
+        path = group["path"]
+        self.drive_busy.add(path)
+        self.drive_note = "ejecting %s..." % os.path.basename(path)
+        self.refresh()
+        mounts = [v["path"] for v in group["volumes"] if v["mount"]]
+        loop = group["kind"] == "loop"
+
+        def work():
+            for volume in mounts:
+                done, message = hypr_devices.unmount(volume)
+                if not done:
+                    GLib.idle_add(self.apply_drive_result, path, False,
+                                  message)
+                    return
+            done, message = (hypr_devices.loop_delete(path) if loop
+                             else hypr_devices.power_off(path))
+            GLib.idle_add(self.apply_drive_result, path, done, message)
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_drive_result(self, path, done, message):
+        self.drive_busy.discard(path)
+        self.drive_note = message if done else "could not: %s" % message
+        self.refresh_drives()
+        return False
+
+    # -- drive state --------------------------------------------------------
+    def refresh_drives(self):
+        def work():
+            found = hypr_devices.list_drives(self.config["drives_fixed"])
+            GLib.idle_add(self.apply_drives, found)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_drives(self, found):
+        self.drives = found
+        self.refresh()
+        return False
+
+    def schedule_drives(self):
+        """One redraw for the burst of udev events a plug-in produces."""
+        if self.drive_pending:
+            GLib.source_remove(self.drive_pending)
+        self.drive_pending = GLib.timeout_add(900, self.drives_settled)
+        return False
+
+    def drives_settled(self):
+        self.drive_pending = 0
+        self.refresh_drives()
+        return False
+
+    def watch_block_events(self):
+        """Hotplug, live: a stick appears the moment udev has settled.
+
+        The udev stream, not the kernel one - kernel uevents need root,
+        and the udev events are the ones that arrive after the device has
+        been set up, which is when there is anything worth drawing.
+        """
+        def reader():
+            try:
+                stream = subprocess.Popen(
+                    ["udevadm", "monitor", "--udev",
+                     "--subsystem-match=block"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True)
+            except OSError:
+                return
+            for line in stream.stdout:
+                if "UDEV" in line and any(
+                        word in line for word in (" add ", " remove ",
+                                                  " change ", " bind ")):
+                    GLib.idle_add(self.schedule_drives)
+        threading.Thread(target=reader, daemon=True).start()
 
     # -- printers and scanners ----------------------------------------------
     def profile(self):
@@ -724,18 +1160,17 @@ class WindowMap:
         section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         section.add_css_class("ws")
 
-        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        name = Gtk.Label(label="DEVICES", xalign=0.0)
-        name.add_css_class("devices-title")
-        head.append(name)
-        head.append(Gtk.Box(hexpand=True))
+        head = self.section_head("DEVICES", "devices_open",
+                                 len(self.printers) + len(self.scanners))
+        section.append(head)
+        if not self.config["devices_open"]:
+            return section
         again = Gtk.Button(label="looking..." if self.looking else "refresh")
         again.add_css_class("device-button")
         again.set_tooltip_text("look for printers and scanners again")
         again.set_sensitive(not self.looking)
         again.connect("clicked", lambda *_: self.refresh_devices(force=True))
         head.append(again)
-        section.append(head)
 
         for printer in self.printers:
             section.append(self.device_row(printer))
@@ -773,7 +1208,7 @@ class WindowMap:
             row.append(where)
             buttons = Gtk.FlowBox()
             buttons.set_selection_mode(Gtk.SelectionMode.NONE)
-            buttons.set_max_children_per_line(4)
+            buttons.set_max_children_per_line(8)
             buttons.set_column_spacing(4)
             buttons.set_row_spacing(4)
             scan = Gtk.Button(label="scanning..." if self.scanning else "scan")
@@ -855,16 +1290,30 @@ class WindowMap:
         mark = {"online": "on", "absent": "off", "refused": "no answer",
                 "local": "usb"}.get(link, "checking")
         good = link in ("online", "local")
-        badge = Gtk.Label(label=mark)
+        # A printer that is not answering is the only time there is anything
+        # to do about it, and the thing to do is wake it. That is the badge
+        # itself: a fifth button does not fit on one row at this width, and
+        # a row of its own for a button you see once a week is a row this
+        # dock cannot spare.
+        asleep = link in ("absent", "refused")
+        badge = Gtk.Button(label=mark + " \u23fb") if asleep \
+            else Gtk.Label(label=mark)
         badge.add_css_class("pill")
         badge.add_css_class("pill-ok" if good else
                             ("pill-bad" if link else "pill-idle"))
         badge.set_tooltip_text(
             {"absent": "its name does not resolve: the device is not on the "
-                       "network. Switch it on, or join the network it is on.",
-             "refused": "the host answers but the print port is closed",
+                       "network.\n\nClick to send a wake-on-LAN packet. That "
+                       "only reaches a printer that is asleep with its "
+                       "network interface still powered - one that is "
+                       "properly off, any battery printer that has shut "
+                       "down, needs its own power button.",
+             "refused": "the host answers but the print port is closed.\n\n"
+                        "Click to send a wake-on-LAN packet.",
              "online": "answering on its print port",
              "local": "connected directly, not over the network"}.get(link, ""))
+        if asleep:
+            badge.connect("clicked", self.on_wake, printer["uri"])
         top.append(badge)
         row.append(top)
 
@@ -903,7 +1352,7 @@ class WindowMap:
 
         buttons = Gtk.FlowBox()
         buttons.set_selection_mode(Gtk.SelectionMode.NONE)
-        buttons.set_max_children_per_line(4)
+        buttons.set_max_children_per_line(8)
         buttons.set_column_spacing(4)
         buttons.set_row_spacing(4)
         enabled = printer["state"] != "disabled"
@@ -930,17 +1379,6 @@ class WindowMap:
             if label == "cancel" and not jobs:
                 button.set_sensitive(False)
             buttons.insert(button, -1)
-        if link in ("absent", "refused"):
-            wake = Gtk.Button(label="wake")
-            wake.add_css_class("device-button")
-            wake.set_tooltip_text(
-                "send a wake-on-LAN packet. This only reaches a printer that "
-                "is asleep with its network interface still powered. One that "
-                "is properly off - any battery printer that has shut down - "
-                "cannot be switched on by a host at all; it needs its own "
-                "power button.")
-            wake.connect("clicked", self.on_wake, printer["uri"])
-            buttons.insert(wake, -1)
         row.append(buttons)
         return row
 
@@ -1145,9 +1583,15 @@ class WindowMap:
         if is_active:
             section.add_css_class("ws-active")
 
+        if self.config["ws_colors"]:
+            section.add_css_class("ws-c%d" % self.ws_tone(key))
+
         label = str(key) if isinstance(key, int) else key.upper()
         name = Gtk.Label(label=label, xalign=0.0 if self.vertical else 0.5)
         name.add_css_class("ws-name")
+        # Shrink-to-fit, or the colour would paint the whole header width
+        # instead of sitting behind the number as a badge.
+        name.set_halign(Gtk.Align.START if self.vertical else Gtk.Align.CENTER)
         if is_active:
             name.add_css_class("ws-name-active")
         section.append(name)
@@ -1167,6 +1611,19 @@ class WindowMap:
         target.connect("leave", self.on_drop_leave, section)
         section.add_controller(target)
         return section
+
+    def ws_tone(self, key):
+        """Which colour in the ring this workspace gets.
+
+        Numbered workspaces take their own slot, so a desktop keeps its
+        colour for as long as it keeps its number. Named (special)
+        workspaces have no number to key off, so they hash into the same
+        ring - stable across restarts, which a counter would not be.
+        """
+        count = len(ws_colors(palette()))
+        if isinstance(key, int):
+            return (key - 1) % count
+        return sum(ord(c) for c in str(key)) % count
 
     def build_chip(self, client, focused):
         address = client.get("address", "")
@@ -1309,6 +1766,11 @@ def main():
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
                          lambda: (widget.toggle_visible(), True)[1])
     widget.watch_events()
+    if config["drives"]:
+        widget.refresh_drives()
+        widget.watch_block_events()
+        GLib.timeout_add_seconds(config["drives_seconds"],
+                                 widget.refresh_drives)
     if config["devices"]:
         widget.refresh_devices()
         widget.find_scanners()

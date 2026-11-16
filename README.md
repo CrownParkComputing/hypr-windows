@@ -104,6 +104,38 @@ To put it on the bar in place of waybar's workspace buttons, see
 | `L` `R` `T` `B` | Moves the dock to that edge |
 | `DEV` | Shows or hides the printers and scanners section |
 | `LOCKED` / `POP-IN` | Locks the dock open, or lets it slide away |
+| Click a section heading | Folds **DRIVES** or **DEVICES** away, and remembers |
+
+### A colour per desktop
+
+Each workspace number is a badge in its own colour, and that colour carries
+to the section's border when it is the active one and to the window chips
+inside it. The ring is not a fixed palette: it starts at the hue of
+`$primary` in `~/.config/hypr/colors.conf` and walks round the wheel from
+there, so workspace 1 always matches the rest of the dock and a re-themed
+wallpaper re-colours all nine together. Saturation and value are floored,
+because a palette pulled from a washed-out wallpaper would otherwise give
+nine shades of the same grey. Set `"ws_colors": false` for the old look.
+
+### Drives
+
+Every disk you can mount, grouped by the thing you plugged in: filesystem
+and size, how full it is, where it is mounted, and buttons to **open**,
+**mount**/**unmount** and **eject** it. Removing a drive or plugging one in
+redraws the section straight away — it reads the udev stream rather than
+polling.
+
+The heading's **plugged in** / **all** button switches between what is
+removable or mounted under `/mnt` and `/run/media` (the default, and the
+only thing worth keeping in a 300px strip) and every disk in the machine.
+
+What the buttons can do is not a matter of taste. polkit lets an active
+local session mount and unmount anything udisks does **not** flag as part of
+the system, and refuses the rest unless an authentication agent is running
+to ask for a password; a mount point that belongs to the running system —
+`/`, `/home`, `/boot` and the rest — gets no unmount button at all, because
+pulling one of those out from under a live session is not a thing a button
+should make easy.
 
 ### Printers and scanners
 
@@ -130,7 +162,13 @@ you change them from the dock:
   "width": 300,            // thickness of a left/right dock
   "hide_delay_ms": 600,    // grace period before it slides away again
   "trigger_px": 4,         // sliver left on screen to touch when slid out
+  "ws_colors": true,       // a colour per desktop, spun off the accent
+  "drives": true,          // disks and sticks you can mount from the dock
+  "drives_fixed": false,   // true also lists the machine's own disks
+  "drives_seconds": 30,    // safety-net re-read; hotplug arrives by udev
+  "drives_open": true,     // false folds the section to its heading
   "devices": true,         // printers and scanners at the end of the list
+  "devices_open": true,    // the same for the printers and scanners
   "device_seconds": 15,    // re-read the local CUPS queue
   "probe_seconds": 90,     // re-test whether printers answer
   "scanner_seconds": 600   // re-enumerate SANE scanners
@@ -181,6 +219,18 @@ Three things here cost real time to find:
   unmapped dock cannot catch a pointer. Pop-in therefore keeps one surface
   mapped and slides it off the edge with a negative margin, leaving a few
   pixels to touch.
+
+- **`HintSystem` is the whole story for a mount button.** udisks sets it for
+  anything that looks like part of the installed system — a disk that is not
+  removable, a volume named in `fstab` — and polkit's default rules only let
+  an active local session mount and unmount devices *without* it. So it is
+  not decoration: it is the difference between a button that works and one
+  that returns `NotAuthorized` on a desktop with no polkit agent running.
+- **A pinned section still has to fit on the screen.** Drives, a printer and
+  a scanner together are taller than the strip, and the window list above
+  can only give up so much: whatever lands past the bottom edge is not
+  merely ugly, it is unreachable. The bottom of the dock is its own
+  scroller, capped at 55% of the monitor, and either section folds away.
 
 The dock sets `KeyboardMode.NONE`: with keyboard focus it would become the
 focused window and the focus line would only ever name itself. It sits on
