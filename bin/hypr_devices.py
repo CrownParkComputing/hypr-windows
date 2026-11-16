@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -374,6 +375,53 @@ def printer_status(name, timeout=8):
 
 
 # -------------------------------------------------------------------- disks --
+def tray_state():
+    """What the status icons used to show on the bar: sound, net, bt, swaync.
+
+    One cheap call each and none of them blocks for long, but `bluetoothctl`
+    can take a second when the adapter is asleep, so this belongs on the same
+    worker thread as everything else here.
+    """
+    state = {"volume": None, "muted": False, "net": "", "net_name": "",
+             "bt_on": False, "bt_connected": False, "notifications": 0,
+             "dnd": False}
+
+    sound = run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], timeout=3)
+    match = re.search(r"Volume:\s*([0-9.]+)", sound)
+    if match:
+        state["volume"] = int(round(float(match.group(1)) * 100))
+    state["muted"] = "[MUTED]" in sound
+
+    for line in run(["nmcli", "-t", "-f", "TYPE,STATE,CONNECTION",
+                     "device", "status"], timeout=4).splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[1] == "connected" and \
+                parts[0] in ("wifi", "ethernet"):
+            state["net"], state["net_name"] = parts[0], parts[2]
+            break
+
+    state["bt_on"] = "Powered: yes" in run(["bluetoothctl", "show"], timeout=4)
+    state["bt_connected"] = any(
+        line.strip() for line in
+        run(["bluetoothctl", "devices", "Connected"], timeout=4).splitlines())
+
+    count = run(["swaync-client", "-c"], timeout=3).strip()
+    state["notifications"] = int(count) if count.isdigit() else 0
+    state["dnd"] = run(["swaync-client", "-D"], timeout=3).strip() == "true"
+    return state
+
+
+def set_volume(step):
+    """Nudge the default sink, the way a scroll on the bar used to."""
+    run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@",
+         "%d%%%s" % (abs(step), "+" if step > 0 else "-"), "-l", "1.5"],
+        timeout=3)
+
+
+def toggle_mute():
+    run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], timeout=3)
+
+
 # Everything below is about block devices: what is attached, what is mounted,
 # and what this session is allowed to mount without being asked for a
 # password. udisks answers all three and is cheap to ask - a full dump is
@@ -460,6 +508,15 @@ def udisks_hints():
             blocks[device][name] = value == "true"
         elif device and name == "Drive":
             blocks[device]["Drive"] = value.strip("'")
+        elif device and name == "BackingFile":
+            # What a loop device is a view of. Worth keeping even after the
+            # device is detached: it is the only way to put the image back.
+            blocks[device]["BackingFile"] = value.strip("'")
+        elif device and name == "SetupByUID":
+            # udisks only lets a session delete the loop devices it set up
+            # itself; anything else needs an admin, which is worth saying
+            # before the button is pressed rather than after.
+            blocks[device]["SetupByUID"] = int(value) if value.isdigit() else -1
     return blocks, drives
 
 
@@ -541,7 +598,8 @@ def list_drives(fixed=False, keep=()):
         children = node.get("children") or []
         if name.startswith("zram") or kind not in ("disk", "loop"):
             continue
-        if not node.get("size") and not children:
+        if not node.get("size") and not children and (node.get("path") or "") \
+                not in keep:
             continue                      # an nbd slot with nothing in it
         bus = node.get("tran") or ("loop" if kind == "loop" else "")
         hint = hints.get(node.get("path") or "", {})
@@ -560,6 +618,8 @@ def list_drives(fixed=False, keep=()):
             "optical": bool(drive.get("Optical")),
             "can_power_off": bool(drive.get("CanPowerOff")),
             "ejectable": bool(drive.get("Ejectable")),
+            "backing_file": hint.get("BackingFile", ""),
+            "setup_uid": hint.get("SetupByUID"),
             "volumes": [],
         }
         # A disk formatted whole - most USB sticks - is its own volume.
@@ -585,6 +645,32 @@ def list_drives(fixed=False, keep=()):
         if fixed or wanted:
             groups.append(group)
     return groups
+
+
+def prune_ejected(ejected, found, now, grace):
+    """Which ejected drives are still worth showing as ejected.
+
+    A listing started before the eject finishes lands after it with the old
+    answer, and used to erase the result: the drive was powered down, the
+    stale listing called it an ordinary disk, and the eject button reappeared
+    on a drive that was already off. Anything ejected within `grace` seconds
+    is believed over the listing.
+    """
+    here = {group["path"] for group in found}
+    mounted = {group["path"] for group in found
+               if any(volume["mount"] for volume in group["volumes"])}
+    kept = {}
+    for path, record in ejected.items():
+        if now - record.get("at", 0.0) < grace:
+            kept[path] = record
+        elif path in mounted:
+            continue                  # mounted again: genuinely back in use
+        elif path in here:
+            kept[path] = record       # still enumerated, still safe to unplug
+        elif record.get("backing_file"):
+            kept[path] = record       # a detached image we can put back
+        # else: unplugged at last, and there is nothing left to say
+    return kept
 
 
 def mount(path):
@@ -623,12 +709,37 @@ def loop_delete(path):
     return False, _why(text, path)
 
 
+def loop_setup(image):
+    """Attach a file again after a detach - the re-insert of a disk image."""
+    if not os.path.isfile(image):
+        return False, "%s is not there any more" % os.path.basename(image)
+    code, text = run_full(["udisksctl", "loop-setup", "--no-user-interaction",
+                           "-f", image])
+    if code == 0:
+        where = text.rsplit(" as ", 1)[-1].strip(" .") if " as " in text else ""
+        return True, "attached%s" % (" as %s" % where if where else "")
+    return False, _why(text, image)
+
+
+def optical_eject(path, close=False):
+    """Open or close an optical tray. udisksctl has no verb for this one."""
+    if not shutil.which("eject"):
+        return False, "the eject command is not installed"
+    code, text = run_full(["eject", "-t" if close else "-r", path])
+    if code == 0:
+        return True, "tray %s" % ("closed" if close else "open")
+    return False, text.rsplit(":", 1)[-1].strip()[:120] or "could not eject"
+
+
 def _why(text, path):
     """Turn a D-Bus error into something worth reading on a panel."""
     name = os.path.basename(path)
     if "NotAuthorized.CanObtain" in text or "DismissedAuthorization" in text:
         return ("%s needs authorisation and no polkit agent is running "
                 "(start hyprpolkitagent)" % name)
+    if "loop-delete-others" in text or "SetupByUID" in text:
+        return ("%s was set up by another user - only they or an admin can "
+                "detach it" % name)
     if "NotAuthorized" in text:
         return "not allowed to do that to %s" % name
     if "target is busy" in text or "TargetBusy" in text:

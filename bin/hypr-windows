@@ -102,6 +102,30 @@ if "--help" not in sys.argv and "-h" not in sys.argv:
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import hypr_devices  # noqa: E402
 
+# How long a just-ejected drive is believed over any listing of the devices.
+# udisks takes a moment to drop the drive and the kernel longer still to
+# remove the node, and a refresh that started before the eject lands inside
+# that window with the old answer.
+EJECT_GRACE = 8.0
+
+# The status icons that sat at the right of the top bar, as the same Nerd
+# Font glyphs it used, so nothing has to be relearned by eye.
+TRAY_GLYPHS = {
+    "start": "\uf385",
+    "volume": ("\U000F057E", "\U000F0580", "\U000F057F"),
+    "muted": "\U000F075F",
+    "net_on": "\U000F05A9",
+    "net_off": "\U000F05AA",
+    "bt_on": "\U000F00AF",
+    "bt_connected": "\U000F00B1",
+    "bt_off": "\U000F00B2",
+    "bell": "\uf0f3",
+    "bell_new": "\U000F116B",
+    "lock": "\U000F0425",
+}
+HOME_BIN = os.path.expanduser("~/.local/bin")
+
+
 import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
@@ -466,6 +490,24 @@ def css(colors):
         font-size: 12px;
     }
     .device-button:hover { background: %(primary_container)s; color: %(primary)s; }
+    .tray { padding: 2px 4px 1px 4px; }
+    .tray-button {
+        background: transparent;
+        color: %(on_surface)s;
+        border: none;
+        border-radius: 7px;
+        padding: 2px 2px;
+        min-height: 0;
+        min-width: 0;
+        font-size: 15px;
+    }
+    .tray-button:hover { background: %(primary_container)s; color: %(primary)s; }
+    .tray-dim { color: alpha(%(on_surface)s, 0.45); }
+    .tray-clock {
+        color: %(on_surface)s;
+        font-size: 13px;
+        padding-right: 3px;
+    }
     .trigger { background: transparent; }
     """ % colors
 
@@ -507,12 +549,14 @@ class WindowMap:
         self.printer_status = {}     # printer -> what its queue reports
         self.drives = []             # disks, grouped by the thing you plug in
         self.drive_busy = set()      # paths with an operation in flight
-        self.ejected = set()         # powered off, waiting to be unplugged
+        self.ejected = {}            # path -> what was ejected, and when
         self.drive_note = ""         # what the last mount or eject reported
         self.drive_pending = 0       # debounce timer for a burst of udev
         self.section_state = None    # what the pinned sections last drew
         self.layout = None           # which windows sat where, last redraw
         self.chips = {}              # address -> (title label, chip box)
+        self.tray_buttons = {}       # the status icons along the bottom
+        self.clock_label = None
 
         edges = Gtk4LayerShell.Edge
         anchor = {"left": edges.LEFT, "right": edges.RIGHT,
@@ -614,6 +658,9 @@ class WindowMap:
                     bottom.append(self.devices_box)
         else:
             body.append(self.columns)
+
+        body.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        body.append(self.build_tray())
 
         colors = palette()
         sheet = css(colors)
@@ -940,6 +987,152 @@ class WindowMap:
         head.append(toggle)
         return head
 
+    # -- tray ---------------------------------------------------------------
+    def build_tray(self):
+        """The status icons from the right of the top bar, along the bottom.
+
+        Same glyphs and the same actions the bar ran, so the bar itself has
+        nothing left to do. A start button leads the row because a dock
+        without one sends you back to a keybind you have to remember.
+        """
+        tray = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        tray.add_css_class("tray")
+        icons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        icons.set_homogeneous(True)
+        icons.set_hexpand(True)
+        tray.append(icons)
+
+        def button(key, glyph, tooltip, command, right=None):
+            item = Gtk.Button(label=glyph)
+            item.add_css_class("tray-button")
+            item.set_tooltip_text(tooltip)
+            item.connect("clicked", lambda _b: self.launch(command))
+            if right is not None:
+                gesture = Gtk.GestureClick()
+                gesture.set_button(3)
+                gesture.connect("pressed", lambda *_: self.on_tray_right(key, right))
+                item.add_controller(gesture)
+            self.tray_buttons[key] = item
+            icons.append(item)
+            return item
+
+        button("start", TRAY_GLYPHS["start"], "applications",
+               ["rofi", "-show", "drun"])
+        volume = button("volume", TRAY_GLYPHS["volume"][2], "sound",
+                        ["pavucontrol"], right="mute")
+        scroll = Gtk.EventControllerScroll(
+            flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self.on_tray_scroll)
+        volume.add_controller(scroll)
+        button("net", TRAY_GLYPHS["net_on"], "network",
+               [os.path.join(HOME_BIN, "wifi-menu")])
+        button("bt", TRAY_GLYPHS["bt_off"], "bluetooth", ["overskride"])
+        button("notify", TRAY_GLYPHS["bell"], "notifications",
+               ["swaync-client", "-t", "-sw"],
+               right=["swaync-client", "-d", "-sw"])
+        button("lock", TRAY_GLYPHS["lock"], "lock the screen", ["hyprlock"])
+
+        self.clock_label = Gtk.Label(label=time.strftime("%H:%M"), xalign=1.0)
+        self.clock_label.add_css_class("tray-clock")
+        tray.append(self.clock_label)
+        return tray
+
+    def launch(self, command):
+        """Run a tray action detached, with the rice's click."""
+        sound = os.path.join(HOME_BIN, "rice-sfx")
+        if os.path.exists(sound):
+            subprocess.Popen([sound, "play", "click"],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        try:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            self.drive_note = "%s: %s" % (os.path.basename(command[0]), error)
+            self.refresh_sections()
+
+    def on_tray_right(self, key, action):
+        if action == "mute":
+            threading.Thread(target=self._mute, daemon=True).start()
+        else:
+            self.launch(action)
+
+    def _mute(self):
+        hypr_devices.toggle_mute()
+        GLib.idle_add(self.refresh_tray)
+
+    def on_tray_scroll(self, _controller, _dx, dy):
+        """Scroll the volume the way the bar did: five points a notch."""
+        step = -5 if dy > 0 else 5
+
+        def work():
+            hypr_devices.set_volume(step)
+            GLib.idle_add(self.refresh_tray)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def refresh_tray(self):
+        if not self.tray_buttons:
+            return True
+
+        def work():
+            state = hypr_devices.tray_state()
+            GLib.idle_add(self.apply_tray, state)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def apply_tray(self, state):
+        if not self.tray_buttons:
+            return False
+        volume, muted = state["volume"], state["muted"]
+        sound = self.tray_buttons["volume"]
+        if muted or volume is None:
+            sound.set_label(TRAY_GLYPHS["muted"])
+            sound.set_tooltip_text("muted - right-click to unmute")
+        else:
+            steps = TRAY_GLYPHS["volume"]
+            sound.set_label(steps[min(len(steps) - 1, volume // 34)])
+            sound.set_tooltip_text(
+                "volume %d%% - scroll to change, right-click to mute, click "
+                "for pavucontrol" % volume)
+        self._dim(sound, muted)
+
+        net = self.tray_buttons["net"]
+        net.set_label(TRAY_GLYPHS["net_on"] if state["net"]
+                      else TRAY_GLYPHS["net_off"])
+        net.set_tooltip_text("%s: %s" % (state["net"], state["net_name"])
+                             if state["net"] else "disconnected")
+        self._dim(net, not state["net"])
+
+        bt = self.tray_buttons["bt"]
+        bt.set_label(TRAY_GLYPHS["bt_connected"] if state["bt_connected"]
+                     else TRAY_GLYPHS["bt_on"] if state["bt_on"]
+                     else TRAY_GLYPHS["bt_off"])
+        bt.set_tooltip_text("bluetooth: %s" % (
+            "a device is connected" if state["bt_connected"]
+            else "on, nothing connected" if state["bt_on"] else "off"))
+        self._dim(bt, not state["bt_on"])
+
+        bell = self.tray_buttons["notify"]
+        count = state["notifications"]
+        bell.set_label(TRAY_GLYPHS["bell_new"] if count
+                       else TRAY_GLYPHS["bell"])
+        bell.set_tooltip_text(
+            ("do not disturb - " if state["dnd"] else "")
+            + ("%d waiting" % count if count else "nothing waiting")
+            + " - right-click for do not disturb")
+        self._dim(bell, state["dnd"])
+
+        self.clock_label.set_label(time.strftime("%H:%M"))
+        self.clock_label.set_tooltip_text(time.strftime("%A %d %B %Y"))
+        return False
+
+    def _dim(self, widget, dim):
+        if dim:
+            widget.add_css_class("tray-dim")
+        else:
+            widget.remove_css_class("tray-dim")
+
     def on_section_toggle(self, _button, key):
         self.config[key] = not self.config[key]
         save_config(self.config)
@@ -977,7 +1170,12 @@ class WindowMap:
 
         for group in self.drives:
             section.append(self.drive_card(group))
-        if not self.drives:
+        live = {g["path"] for g in self.drives}
+        detached = [(path, record) for path, record in sorted(self.ejected.items())
+                    if path not in live and record.get("backing_file")]
+        for path, record in detached:
+            section.append(self.detached_card(path, record))
+        if not self.drives and not detached:
             empty = Gtk.Label(label="nothing plugged in", xalign=0.0)
             empty.add_css_class("empty")
             section.append(empty)
@@ -1024,6 +1222,9 @@ class WindowMap:
             told = Gtk.Label(label="ejected - safe to unplug", xalign=0.0)
             told.add_css_class("pill")
             told.add_css_class("pill-idle")
+            told.set_tooltip_text(
+                "the drive is powered down; unplug it and plug it back in to "
+                "use it again")
             holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             holder.append(told)
             row.append(holder)
@@ -1037,8 +1238,11 @@ class WindowMap:
         if loop or (group["removable"] and group["can_power_off"]):
             eject = Gtk.Button(label="detach" if loop else "eject")
             eject.add_css_class("device-button")
+            mine = group.get("setup_uid") in (None, os.getuid())
             eject.set_tooltip_text(
-                "unmount this image and detach the loop device" if loop else
+                ("unmount this image and detach the loop device"
+                 + ("" if mine else " - set up by another user, so this needs "
+                                   "an admin")) if loop else
                 "unmount everything on this drive and power it down, so it "
                 "is safe to unplug")
             eject.set_sensitive(group["path"] not in self.drive_busy)
@@ -1058,6 +1262,51 @@ class WindowMap:
             buttons.set_column_spacing(4)
             buttons.insert(eject, -1)
             row.append(buttons)
+        return row
+
+    def detached_card(self, path, record):
+        """A disk image with nothing attached: the one eject we can undo.
+
+        A powered-off USB drive has to be pulled out and put back in - nothing
+        in a user session can re-energise a port - but a loop device is only a
+        file, so the detach has an obvious opposite and this offers it.
+        """
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        row.add_css_class("chip")
+        image = record.get("backing_file") or ""
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        name = Gtk.Label(label=os.path.basename(image) or record.get("name", ""),
+                         xalign=0.0)
+        name.add_css_class("device-name")
+        name.set_ellipsize(3)
+        name.set_max_width_chars(20)
+        name.set_hexpand(True)
+        name.set_tooltip_text(image)
+        top.append(name)
+        pill = Gtk.Label(label="detached")
+        pill.add_css_class("pill")
+        pill.add_css_class("pill-idle")
+        top.append(pill)
+        row.append(top)
+
+        buttons = Gtk.FlowBox()
+        buttons.set_selection_mode(Gtk.SelectionMode.NONE)
+        buttons.set_max_children_per_line(8)
+        buttons.set_column_spacing(4)
+        attach = Gtk.Button(label="re-attach")
+        attach.add_css_class("device-button")
+        attach.set_tooltip_text("map %s to a loop device again" % image)
+        attach.set_sensitive(path not in self.drive_busy
+                             and os.path.isfile(image))
+        attach.connect("clicked", self.on_drive_reattach, path, record)
+        buttons.insert(attach, -1)
+        forget = Gtk.Button(label="forget")
+        forget.add_css_class("device-button")
+        forget.set_tooltip_text("stop listing this image")
+        forget.connect("clicked", self.on_drive_forget, path)
+        buttons.insert(forget, -1)
+        row.append(buttons)
         return row
 
     def volume_block(self, volume, single, eject=None):
@@ -1176,6 +1425,12 @@ class WindowMap:
         self.refresh_sections()
         mounts = [v["path"] for v in group["volumes"] if v["mount"]]
         loop = group["kind"] == "loop"
+        record = {
+            "kind": group["kind"],
+            "backing_file": group.get("backing_file", ""),
+            "name": (group["model"] or group["name"]),
+            "bus": group["bus"],
+        }
 
         def work():
             for volume in mounts:
@@ -1187,9 +1442,38 @@ class WindowMap:
             done, message = (hypr_devices.loop_delete(path) if loop
                              else hypr_devices.power_off(path))
             if done:
-                GLib.idle_add(self.ejected.add, path)
+                GLib.idle_add(self.remember_ejected, path, record)
             GLib.idle_add(self.apply_drive_result, path, done, message)
         threading.Thread(target=work, daemon=True).start()
+
+    def remember_ejected(self, path, record):
+        record["at"] = time.monotonic()
+        self.ejected[path] = record
+        return False
+
+    def on_drive_reattach(self, _button, path, record):
+        """Put a detached image back - the re-insert of a disk image."""
+        image = record.get("backing_file") or ""
+        self.drive_busy.add(path)
+        self.drive_note = "attaching %s..." % os.path.basename(image)
+        self.refresh_sections()
+
+        def work():
+            done, message = hypr_devices.loop_setup(image)
+            GLib.idle_add(self.apply_reattach, path, done, message)
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_reattach(self, path, done, message):
+        self.drive_busy.discard(path)
+        if done:
+            self.ejected.pop(path, None)
+        self.drive_note = message if done else "could not: %s" % message
+        self.refresh_drives()
+        return False
+
+    def on_drive_forget(self, _button, path):
+        self.ejected.pop(path, None)
+        self.refresh_sections()
 
     def apply_drive_result(self, path, done, message):
         self.drive_busy.discard(path)
@@ -1208,13 +1492,8 @@ class WindowMap:
 
     def apply_drives(self, found):
         self.drives = found
-        here = {g["path"] for g in found}
-        # Unplugged at last, or plugged back in and mounted: either way it
-        # is no longer a drive waiting to be pulled out.
-        self.ejected = {p for p in self.ejected
-                        if p in here and not any(
-                            v["mount"] for g in found if g["path"] == p
-                            for v in g["volumes"])}
+        self.ejected = hypr_devices.prune_ejected(
+            self.ejected, found, time.monotonic(), EJECT_GRACE)
         self.refresh_sections()
         return False
 
@@ -1884,6 +2163,11 @@ def main():
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
                          lambda: (widget.toggle_visible(), True)[1])
     widget.watch_events()
+    # The tray is cheap to read - about a tenth of a second, most of it
+    # bluetoothctl - so a five-second beat keeps the clock honest to the
+    # minute without being worth a smarter schedule.
+    widget.refresh_tray()
+    GLib.timeout_add_seconds(5, widget.refresh_tray)
     if config["drives"]:
         widget.refresh_drives()
         widget.watch_block_events()

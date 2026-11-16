@@ -106,6 +106,26 @@ To put it on the bar in place of waybar's workspace buttons, see
 | `LOCKED` / `POP-IN` | Locks the dock open, or lets it slide away |
 | Click a section heading | Folds **DRIVES** or **DEVICES** away, and remembers |
 
+### The tray along the bottom
+
+The row under the sections is what a status bar used to carry, so a bar is no
+longer needed for it: a start button (`rofi -show drun`), sound, network,
+bluetooth, notifications, a lock button and the clock. Sound scrolls to change
+the volume and right-clicks to mute; notifications right-click into do not
+disturb. Each icon dims when the thing behind it is off, and the clock's
+tooltip is the date.
+
+### Ejecting, and putting a disk image back
+
+**eject** unmounts everything on a drive and powers it down; on a loop device
+the same button says **detach**. A drive that has been ejected keeps saying
+*ejected - safe to unplug* until it is physically unplugged, rather than
+offering to eject it again - a refresh that started before the eject used to
+land afterwards and undo that. A detached disk image stays listed with a
+**re-attach** button, which is the one eject that can be undone: a powered-off
+USB drive has to be pulled out and plugged back in, because nothing in a user
+session can re-energise a port.
+
 ### A colour per desktop
 
 Each workspace number is a badge in its own colour, and that colour carries
