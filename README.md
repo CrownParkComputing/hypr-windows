@@ -102,6 +102,7 @@ To put it on the bar in place of waybar's workspace buttons, see
 | Drag a chip onto a workspace | Moves that window there |
 | Click a chip's ✕ | Closes that window |
 | `L` `R` `T` `B` | Moves the dock to that edge |
+| `DRV` | Shows or hides the disks and sticks section |
 | `DEV` | Shows or hides the printers and scanners section |
 | `LOCKED` / `POP-IN` | Locks the dock open, or lets it slide away |
 | Click a section heading | Folds **DRIVES** or **DEVICES** away, and remembers |
@@ -124,7 +125,9 @@ offering to eject it again - a refresh that started before the eject used to
 land afterwards and undo that. A detached disk image stays listed with a
 **re-attach** button, which is the one eject that can be undone: a powered-off
 USB drive has to be pulled out and plugged back in, because nothing in a user
-session can re-energise a port.
+session can re-energise a port. The ejected drives are remembered across
+restarts, so `DRV` and `DEV` - which restart the dock to settle the layout -
+do not lose the re-attach button.
 
 ### A colour per desktop
 
@@ -135,7 +138,10 @@ inside it. The ring is not a fixed palette: it starts at the hue of
 there, so workspace 1 always matches the rest of the dock and a re-themed
 wallpaper re-colours all nine together. Saturation and value are floored,
 because a palette pulled from a washed-out wallpaper would otherwise give
-nine shades of the same grey. Set `"ws_colors": false` for the old look.
+nine shades of the same grey. The walk takes two steps at a time, so two
+desktops next to each other are eighty degrees apart rather than forty -
+forty is close enough at the yellow-green end of the wheel that two
+neighbours came out as twins. Set `"ws_colors": false` for the old look.
 
 ### Drives
 

@@ -152,6 +152,10 @@ DEFAULTS = {
     "drives_open": True,    # False folds the section to its heading
     "devices_open": True,   # the same for the printers and scanners
     "devices": True,        # printers and scanners at the end of the list
+    # Drives that have been ejected, and when. Kept because the DRV toggle
+    # restarts the dock, and a detached disk image that loses its re-attach
+    # button on the way is the one eject that can be undone.
+    "ejected": {},
     # What you are scanning decides where it goes and how it is read. Each
     # profile is a folder plus the settings that suit that kind of paper:
     # duplex everywhere because a sheet fed face-down should still come back
@@ -346,6 +350,14 @@ def ws_colors(colors, count=9):
     different design. Saturation and value are floored because a palette
     pulled from a washed-out wallpaper can be nearly grey, and nine shades
     of the same grey is not a colour code.
+
+    The walk takes two steps at a time, so two neighbouring workspaces are
+    eighty degrees apart rather than forty. Forty is too close: at the
+    yellow-green end of the wheel that is two shades of the same green -
+    workspaces 2 and 3 came out as twins - and the purple end gave 6 and 7
+    the same trouble. Two steps at a time still visits every colour on the
+    ring, because two and nine have no common factor, and the first and the
+    last stay eighty degrees apart too.
     """
     try:
         raw = colors["primary"].lstrip("#")
@@ -355,10 +367,13 @@ def ws_colors(colors, count=9):
     hue, sat, val = colorsys.rgb_to_hsv(*base)
     sat = min(0.72, max(0.50, sat))
     val = min(0.95, max(0.80, val))
+    # An even count cannot be walked two steps at a time without visiting
+    # only half of it, so it goes the ordinary way round.
+    stride = 2 if count % 2 else 1
     ring = []
     for index in range(count):
-        tone = colorsys.hsv_to_rgb((hue + index / float(count)) % 1.0,
-                                   sat, val)
+        tone = colorsys.hsv_to_rgb(
+            (hue + index * stride / float(count)) % 1.0, sat, val)
         ring.append("#%02x%02x%02x" % tuple(round(c * 255) for c in tone))
     return ring
 
@@ -549,7 +564,9 @@ class WindowMap:
         self.printer_status = {}     # printer -> what its queue reports
         self.drives = []             # disks, grouped by the thing you plug in
         self.drive_busy = set()      # paths with an operation in flight
-        self.ejected = {}            # path -> what was ejected, and when
+        self.ejected = dict(config.get("ejected") or {}) \
+            if isinstance(config.get("ejected"), dict) else {}
+                                   # path -> what was ejected, and when
         self.drive_note = ""         # what the last mount or eject reported
         self.drive_pending = 0       # debounce timer for a burst of udev
         self.section_state = None    # what the pinned sections last drew
@@ -708,6 +725,15 @@ class WindowMap:
 
         spacer = Gtk.Box(hexpand=True)
         row.append(spacer)
+
+        drives = Gtk.Button(label="DRV")
+        drives.set_tooltip_text("show disks and sticks at the end")
+        if self.config["drives"]:
+            drives.add_css_class("chosen")
+        drives.connect(
+            "clicked",
+            lambda *_: self.restart({"drives": not self.config["drives"]}))
+        row.append(drives)
 
         devices = Gtk.Button(label="DEV")
         devices.set_tooltip_text("show printers and scanners at the end")
@@ -1447,9 +1473,23 @@ class WindowMap:
         threading.Thread(target=work, daemon=True).start()
 
     def remember_ejected(self, path, record):
-        record["at"] = time.monotonic()
+        # Wall-clock, not the monotonic clock: this has to still mean
+        # something after a restart, and a monotonic clock starts again
+        # from zero every boot.
+        record["at"] = time.time()
         self.ejected[path] = record
+        self.save_ejected()
         return False
+
+    def save_ejected(self):
+        """Keep the ejected drives across a restart of the dock.
+
+        The DRV and DEV buttons restart the dock to settle the layout, and a
+        detached disk image that loses its re-attach button on the way is the
+        one eject that can be undone.
+        """
+        self.config["ejected"] = dict(self.ejected)
+        save_config(self.config)
 
     def on_drive_reattach(self, _button, path, record):
         """Put a detached image back - the re-insert of a disk image."""
@@ -1467,12 +1507,14 @@ class WindowMap:
         self.drive_busy.discard(path)
         if done:
             self.ejected.pop(path, None)
+            self.save_ejected()
         self.drive_note = message if done else "could not: %s" % message
         self.refresh_drives()
         return False
 
     def on_drive_forget(self, _button, path):
         self.ejected.pop(path, None)
+        self.save_ejected()
         self.refresh_sections()
 
     def apply_drive_result(self, path, done, message):
@@ -1492,8 +1534,11 @@ class WindowMap:
 
     def apply_drives(self, found):
         self.drives = found
+        before = dict(self.ejected)
         self.ejected = hypr_devices.prune_ejected(
-            self.ejected, found, time.monotonic(), EJECT_GRACE)
+            self.ejected, found, time.time(), EJECT_GRACE)
+        if self.ejected != before:
+            self.save_ejected()
         self.refresh_sections()
         return False
 
